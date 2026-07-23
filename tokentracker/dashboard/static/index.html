@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Token Tracker</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local analytics</p>
+          <h1>Token Tracker</h1>
+        </div>
+        <div class="controls">
+          <select id="window">
+            <option value="">All time</option>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="7d" selected>7 days</option>
+            <option value="30d">30 days</option>
+            <option value="90d">90 days</option>
+          </select>
+          <button id="refresh" title="Refresh analytics">Refresh</button>
+        </div>
+      </header>
+
+      <section class="cards">
+        <article><span>API Equivalent</span><strong id="apiEquivalent">0</strong></article>
+        <article><span>Total Tokens</span><strong id="totalTokens">0</strong></article>
+        <article><span>Claude Credits</span><strong id="credits">$0.00</strong></article>
+        <article><span>Requests</span><strong id="requests">0</strong></article>
+        <article><span>Threads</span><strong id="threads">0</strong></article>
+      </section>
+
+      <section class="grid">
+        <article class="panel wide">
+          <div class="panel-title">
+            <h2>Tokens / Day</h2>
+            <span id="dailyRange"></span>
+          </div>
+          <div id="dailyChart" class="chart"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-title"><h2>Models</h2></div>
+          <div id="modelsChart" class="bars"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-title"><h2>Projects</h2></div>
+          <div id="projectsChart" class="bars"></div>
+        </article>
+        <article class="panel wide">
+          <div class="panel-title"><h2>Recent Sessions</h2></div>
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Project</th><th>Model</th><th>Tokens</th><th>Cost</th></tr>
+            </thead>
+            <tbody id="recentRows"></tbody>
+          </table>
+        </article>
+      </section>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

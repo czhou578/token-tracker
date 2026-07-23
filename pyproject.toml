@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokentracker"
+version = "0.1.0"
+description = "Local token usage tracker for Claude Code and AI coding assistants."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Token Tracker Contributors" }]
+dependencies = [
+  "fastapi>=0.110",
+  "psutil>=5.9",
+  "pydantic>=2",
+  "typer>=0.12",
+  "uvicorn>=0.27",
+  "watchdog>=4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+tracker = "tokentracker.cli.cli:app"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["tokentracker*"]
+
+[tool.setuptools.package-data]
+tokentracker = ["dashboard/static/*"]

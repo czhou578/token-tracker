@@ -1,0 +1,4 @@
+APP_NAME = "tokentracker"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+CLAUDE_PROVIDER = "claude"
