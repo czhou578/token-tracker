@@ -36,6 +36,25 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_thread ON usage_events(thread_id);
 """
 
+INSERT_COLUMNS = (
+    "source_id",
+    "timestamp",
+    "thread_id",
+    "conversation_id",
+    "project",
+    "provider",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+    "latency_ms",
+    "cost_usd",
+    "metadata_json",
+)
+
 
 class UsageDatabase:
     def __init__(self, path: Path):
@@ -53,40 +72,14 @@ class UsageDatabase:
             connection.executescript(SCHEMA)
 
     def insert_events(self, events: Iterable[UsageEvent]) -> int:
-        rows = [event.normalized() for event in events]
+        rows = [_event_row(event) for event in events]
         if not rows:
             return 0
         with self.connect() as connection:
             before = connection.total_changes
             connection.executemany(
-                """
-                INSERT OR IGNORE INTO usage_events (
-                    source_id, timestamp, thread_id, conversation_id, project, provider, model,
-                    prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
-                    reasoning_tokens, total_tokens, latency_ms, cost_usd, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        event.source_id,
-                        event.timestamp.astimezone(timezone.utc).isoformat(),
-                        event.thread_id,
-                        event.conversation_id,
-                        event.project,
-                        event.provider,
-                        event.model,
-                        event.prompt_tokens,
-                        event.completion_tokens,
-                        event.cache_read_tokens,
-                        event.cache_write_tokens,
-                        event.reasoning_tokens,
-                        event.total_tokens,
-                        event.latency_ms,
-                        event.cost_usd,
-                        event.metadata_json,
-                    )
-                    for event in rows
-                ],
+                _insert_sql(),
+                rows,
             )
             return connection.total_changes - before
 
@@ -111,7 +104,7 @@ class UsageDatabase:
                 """,
                 values,
             ).fetchone()
-        result = dict(row)
+        result = _dict(row)
         result["api_equivalent_tokens"] = result["total_tokens"]
         result["claude_credits"] = round(result["cost_usd"], 4)
         return result
@@ -146,7 +139,7 @@ class UsageDatabase:
                 """,
                 values,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return _dicts(rows)
 
     def timeline(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("strftime('%Y-%m-%d %H:00:00', timestamp)", "hour", filters)
@@ -163,7 +156,7 @@ class UsageDatabase:
                 """,
                 (*values, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return _dicts(rows)
 
     def settings(self) -> dict[str, Any]:
         return {"database": str(self.path), "exists": self.path.exists()}
@@ -189,7 +182,7 @@ class UsageDatabase:
                 """,
                 values,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return _dicts(rows)
 
     def _filters(self, filters: dict[str, Any]) -> tuple[str, tuple[Any, ...]]:
         clauses: list[str] = []
@@ -209,6 +202,27 @@ class UsageDatabase:
         if not clauses:
             return "", tuple()
         return "WHERE " + " AND ".join(clauses), tuple(values)
+
+
+def _insert_sql() -> str:
+    columns = ", ".join(INSERT_COLUMNS)
+    placeholders = ", ".join("?" for _ in INSERT_COLUMNS)
+    return f"INSERT OR IGNORE INTO usage_events ({columns}) VALUES ({placeholders})"
+
+
+def _event_row(event: UsageEvent) -> tuple[Any, ...]:
+    event = event.normalized()
+    values = event.model_dump()
+    values["timestamp"] = event.timestamp.astimezone(timezone.utc).isoformat()
+    return tuple(values[column] for column in INSERT_COLUMNS)
+
+
+def _dict(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def _dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [_dict(row) for row in rows]
 
 
 def _window_bounds(window: str | None) -> tuple[datetime | None, datetime | None]:

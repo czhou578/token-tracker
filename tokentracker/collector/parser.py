@@ -10,6 +10,15 @@ from tokentracker.shared.constants import CLAUDE_PROVIDER
 from tokentracker.shared.pricing import estimate_cost_usd
 
 
+TOKEN_KEYS = {
+    "prompt_tokens": "input_tokens",
+    "completion_tokens": "output_tokens",
+    "cache_read_tokens": "cache_read_input_tokens",
+    "cache_write_tokens": "cache_creation_input_tokens",
+    "reasoning_tokens": "reasoning_tokens",
+}
+
+
 def parse_claude_jsonl(path: Path, root: Path | None = None) -> Iterable[UsageEvent]:
     root = root or path.parent
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -32,18 +41,8 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
     if not isinstance(usage, dict):
         return None
 
-    prompt_tokens = _int(usage.get("input_tokens"))
-    completion_tokens = _int(usage.get("output_tokens"))
-    cache_read_tokens = _int(usage.get("cache_read_input_tokens"))
-    cache_write_tokens = _int(usage.get("cache_creation_input_tokens"))
-    reasoning_tokens = _int(usage.get("reasoning_tokens"))
-    total_tokens = (
-        prompt_tokens
-        + completion_tokens
-        + cache_read_tokens
-        + cache_write_tokens
-        + reasoning_tokens
-    )
+    token_counts = {field: _int(usage.get(key)) for field, key in TOKEN_KEYS.items()}
+    total_tokens = sum(token_counts.values())
     if total_tokens == 0:
         return None
 
@@ -55,10 +54,10 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
     source_id = f"{path.resolve()}:{line_no}"
     cost_usd = estimate_cost_usd(
         model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=cache_write_tokens,
+        prompt_tokens=token_counts["prompt_tokens"],
+        completion_tokens=token_counts["completion_tokens"],
+        cache_read_tokens=token_counts["cache_read_tokens"],
+        cache_write_tokens=token_counts["cache_write_tokens"],
     )
 
     metadata = {
@@ -77,11 +76,7 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
         project=project,
         provider=CLAUDE_PROVIDER,
         model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=cache_write_tokens,
-        reasoning_tokens=reasoning_tokens,
+        **token_counts,
         total_tokens=total_tokens,
         cost_usd=cost_usd,
         metadata_json=json.dumps(metadata, separators=(",", ":")),

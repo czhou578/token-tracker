@@ -5,6 +5,15 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 
+TOKEN_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
 class UsageEvent(BaseModel):
     source_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -24,11 +33,5 @@ class UsageEvent(BaseModel):
     metadata_json: str = "{}"
 
     def normalized(self) -> "UsageEvent":
-        total = self.total_tokens or (
-            self.prompt_tokens
-            + self.completion_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens
-            + self.reasoning_tokens
-        )
+        total = self.total_tokens or sum(getattr(self, field) for field in TOKEN_FIELDS)
         return self.model_copy(update={"total_tokens": total})

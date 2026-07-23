@@ -8,10 +8,11 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
+from textwrap import dedent
 
 import typer
 
-from tokentracker.collector.config import get_settings
+from tokentracker.collector.config import Settings, get_settings
 from tokentracker.collector.database import UsageDatabase
 from tokentracker.collector.service import Collector
 
@@ -30,7 +31,7 @@ def dashboard() -> None:
     settings = get_settings()
     Collector().scan_once()
     url = f"http://{settings.host}:{settings.port}"
-    _ensure_server(url)
+    _ensure_server(url, settings)
     webbrowser.open(url)
     typer.echo(f"Opened {url}")
 
@@ -60,17 +61,13 @@ def week() -> None:
 @app.command()
 def projects() -> None:
     """Print usage grouped by project."""
-    Collector().scan_once()
-    database = UsageDatabase(get_settings().db_path)
-    _print_table(database.projects(window="30d"), "project")
+    _print_table(_database_after_scan().projects(window="30d"), "project")
 
 
 @app.command()
 def models() -> None:
     """Print usage grouped by model."""
-    Collector().scan_once()
-    database = UsageDatabase(get_settings().db_path)
-    _print_table(database.models(window="30d"), "model")
+    _print_table(_database_after_scan().models(window="30d"), "model")
 
 
 @app.command("install-service")
@@ -80,34 +77,19 @@ def install_service() -> None:
     service_dir = Path.home() / ".config" / "systemd" / "user"
     service_dir.mkdir(parents=True, exist_ok=True)
     service_file = service_dir / "tokentracker.service"
-    service_file.write_text(
-        "\n".join(
-            [
-                "[Unit]",
-                "Description=Token Tracker background collector",
-                "",
-                "[Service]",
-                f"ExecStart={sys.executable} -m tokentracker.collector.service",
-                "Restart=on-failure",
-                f"Environment=TOKEN_TRACKER_HOME={settings.data_dir}",
-                f"Environment=TOKEN_TRACKER_CLAUDE_DIR={settings.claude_dir}",
-                "",
-                "[Install]",
-                "WantedBy=default.target",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    service_file.write_text(_systemd_service(settings), encoding="utf-8")
     typer.echo(f"Wrote {service_file}")
     typer.echo("Enable it with: systemctl --user enable --now tokentracker")
 
 
 def _print_summary(window: str) -> None:
-    Collector().scan_once()
-    database = UsageDatabase(get_settings().db_path)
-    stats = database.stats(window=window)
-    typer.echo(json.dumps(stats, indent=2))
+    typer.echo(json.dumps(_database_after_scan().stats(window=window), indent=2))
+
+
+def _database_after_scan() -> UsageDatabase:
+    collector = Collector()
+    collector.scan_once()
+    return collector.database
 
 
 def _print_table(rows: list[dict], label: str) -> None:
@@ -122,12 +104,12 @@ def _print_table(rows: list[dict], label: str) -> None:
         )
 
 
-def _ensure_server(url: str) -> None:
+def _ensure_server(url: str, settings: Settings | None = None) -> None:
     health_url = f"{url}/api/health"
     if _is_healthy(health_url):
         return
 
-    settings = get_settings()
+    settings = settings or get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     log_file = settings.data_dir / "server.log"
     with log_file.open("ab") as log:
@@ -152,3 +134,21 @@ def _is_healthy(url: str) -> bool:
             return response.status == 200
     except (urllib.error.URLError, TimeoutError):
         return False
+
+
+def _systemd_service(settings: Settings) -> str:
+    return dedent(
+        f"""\
+        [Unit]
+        Description=Token Tracker background collector
+
+        [Service]
+        ExecStart={sys.executable} -m tokentracker.collector.service
+        Restart=on-failure
+        Environment=TOKEN_TRACKER_HOME={settings.data_dir}
+        Environment=TOKEN_TRACKER_CLAUDE_DIR={settings.claude_dir}
+
+        [Install]
+        WantedBy=default.target
+        """
+    )
