@@ -16,7 +16,7 @@ pip install -e .
 tracker
 ```
 
-This starts the local dashboard server if needed and opens the dashboard in your browser.
+This starts the local dashboard server if needed and opens the dashboard in your browser. 
 
 Useful commands:
 
