@@ -106,7 +106,6 @@ class UsageDatabase:
             ).fetchone()
         result = _dict(row)
         result["api_equivalent_tokens"] = result["total_tokens"]
-        result["claude_credits"] = round(result["cost_usd"], 4)
         return result
 
     def daily(self, **filters: Any) -> list[dict[str, Any]]:

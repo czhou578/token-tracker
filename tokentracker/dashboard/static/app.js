@@ -1,7 +1,6 @@
 const ids = {
   apiEquivalent: document.querySelector("#apiEquivalent"),
   totalTokens: document.querySelector("#totalTokens"),
-  credits: document.querySelector("#credits"),
   requests: document.querySelector("#requests"),
   threads: document.querySelector("#threads"),
   dailyChart: document.querySelector("#dailyChart"),
