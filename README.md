@@ -6,6 +6,16 @@ Token Tracker watches Claude Code JSONL session logs, stores usage events in a l
 
 ## Install
 
+### Development (recommended)
+
+```bash
+uv venv
+uv sync
+source .venv/bin/activate
+```
+
+### Production
+
 ```bash
 pip install -e .
 ```
