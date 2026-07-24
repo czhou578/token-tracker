@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from tokentracker.collector.models import UsageEvent
-from tokentracker.shared.constants import CLAUDE_PROVIDER
+from tokentracker.collector.config import CLAUDE_PROVIDER
 from tokentracker.shared.pricing import estimate_cost_usd
 
 

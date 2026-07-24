@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 import time
@@ -34,6 +35,27 @@ def dashboard() -> None:
     _ensure_server(url, settings)
     webbrowser.open(url)
     typer.echo(f"Opened {url}")
+
+
+@app.command()
+def run(once: bool = typer.Option(False, "--once", help="Scan once and exit.")) -> None:
+    """Run the background collector."""
+    collector = Collector()
+    inserted = collector.scan_once()
+    if once:
+        typer.echo(f"Inserted {inserted} usage events.")
+        return
+
+    def stop(_signum: int, _frame: object) -> None:
+        raise typer.Exit()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    typer.echo(f"Token Tracker collector watching {collector.root}")
+    while True:
+        collector.scan_once()
+        time.sleep(collector.settings.poll_seconds)
 
 
 @app.command()

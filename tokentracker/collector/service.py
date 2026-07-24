@@ -4,13 +4,9 @@ import signal
 import time
 from pathlib import Path
 
-import typer
-
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
 from tokentracker.collector.parser import parse_claude_jsonl
-
-app = typer.Typer(help="Run the Token Tracker background collector.")
 
 
 class Collector:
@@ -42,16 +38,10 @@ class Collector:
             time.sleep(self.settings.poll_seconds)
 
 
-@app.command()
-def run(once: bool = typer.Option(False, "--once", help="Scan once and exit.")) -> None:
-    collector = Collector()
-    inserted = collector.scan_once()
-    if once:
-        typer.echo(f"Inserted {inserted} usage events.")
-        return
-    typer.echo(f"Token Tracker collector watching {collector.root}")
-    collector.run_forever()
+def main() -> None:
+    """Entry point for `python -m tokentracker.collector.service` (systemd service)."""
+    Collector().run_forever()
 
 
 if __name__ == "__main__":
-    app()
+    main()

@@ -1,3 +1,4 @@
 /tokentracker/*/__pycache__/
 /tokentracker/__pycache__/
 tokentracker.egg-info/
+/tests/__pycache__

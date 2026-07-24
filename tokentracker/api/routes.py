@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, Query
 
 from tokentracker.collector.config import get_settings
@@ -12,7 +14,7 @@ def get_database() -> UsageDatabase:
     return UsageDatabase(get_settings().db_path)
 
 
-def filters(
+def _filters(
     window: str | None = Query(None),
     model: str | None = Query(None),
     project: str | None = Query(None),
@@ -28,45 +30,47 @@ def filters(
     }
 
 
+# Map of endpoint name → database method name
+# Each entry produces a route that calls db.<method>(**filters)
+_ROUTE_METHODS: dict[str, str] = {
+    "stats": "stats",
+    "daily": "daily",
+    "models": "models",
+    "projects": "projects",
+    "threads": "threads",
+    "timeline": "timeline",
+}
+
+
+def _make_route(method: str):
+    """Factory that generates a FastAPI route for *method*."""
+
+    @router.get(f"/{method}")
+    def _route(
+        criteria: dict = Depends(_filters),
+        database: UsageDatabase = Depends(get_database),
+    ) -> Any:
+        return getattr(database, method)(**criteria)
+
+    return _route
+
+
+# Auto-register all CRUD routes
+for _method in _ROUTE_METHODS:
+    _make_route(_method)
+
+
+# ── special endpoints (don't follow the pattern) ────────────────────────
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/stats")
-def stats(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> dict:
-    result = database.stats(**criteria)
-    result["recent"] = database.recent(**criteria)
-    return result
-
-
-@router.get("/daily")
-def daily(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> list[dict]:
-    return database.daily(**criteria)
-
-
-@router.get("/models")
-def models(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> list[dict]:
-    return database.models(**criteria)
-
-
-@router.get("/projects")
-def projects(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> list[dict]:
-    return database.projects(**criteria)
-
-
-@router.get("/threads")
-def threads(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> list[dict]:
-    return database.threads(**criteria)
-
-
-@router.get("/timeline")
-def timeline(criteria: dict = Depends(filters), database: UsageDatabase = Depends(get_database)) -> list[dict]:
-    return database.timeline(**criteria)
-
-
 @router.get("/settings")
-def settings(database: UsageDatabase = Depends(get_database)) -> dict:
+def settings() -> dict:
+    database = get_database()
     values = get_settings()
     return database.settings() | {
         "claude_dir": str(values.claude_dir),

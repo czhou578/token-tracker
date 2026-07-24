@@ -4,7 +4,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from tokentracker.shared.constants import DEFAULT_HOST, DEFAULT_PORT
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+CLAUDE_PROVIDER = "claude"
 
 
 @dataclass(frozen=True)
