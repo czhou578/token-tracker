@@ -13,7 +13,6 @@ const ids = {
 };
 
 const fmt = new Intl.NumberFormat();
-const money = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" });
 
 async function get(path) {
   const windowValue = ids.window.value;
@@ -40,7 +39,6 @@ async function load() {
 function renderStats(stats) {
   ids.apiEquivalent.textContent = fmt.format(stats.api_equivalent_tokens || 0);
   ids.totalTokens.textContent = fmt.format(stats.total_tokens || 0);
-  ids.credits.textContent = money.format(stats.claude_credits || 0);
   ids.requests.textContent = fmt.format(stats.requests || 0);
   ids.threads.textContent = fmt.format(stats.threads || 0);
 }
@@ -100,7 +98,6 @@ function renderRecent(rows) {
       <td>${escapeHtml(row.project || "unknown")}</td>
       <td>${escapeHtml(row.model || "unknown")}</td>
       <td>${fmt.format(row.total_tokens || 0)}</td>
-      <td>${money.format(row.cost_usd || 0)}</td>
     `;
     ids.recentRows.appendChild(tr);
   });
