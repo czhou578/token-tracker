@@ -1,5 +1,9 @@
 # Token Tracker
 
+<img width="3720" height="1920" alt="image" src="https://github.com/user-attachments/assets/0a8d8aed-4df2-4c2b-b36e-8d20e52da763" />
+
+
+
 A zero-configuration local token usage tracker for Claude Code.
 
 Token Tracker watches Claude Code JSONL session logs, stores usage events in a local SQLite database, and serves a lightweight analytics dashboard from `localhost`.
