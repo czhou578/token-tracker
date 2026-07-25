@@ -7,7 +7,6 @@ from typing import Iterable
 
 from tokentracker.collector.models import UsageEvent
 from tokentracker.collector.config import CLAUDE_PROVIDER
-from tokentracker.shared.pricing import estimate_cost_usd
 
 
 TOKEN_KEYS = {
@@ -52,13 +51,6 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
     thread_id = _first_string(payload, "uuid", "requestId", "request_id") or conversation_id
     project = _project_from_path(path, root)
     source_id = f"{path.resolve()}:{line_no}"
-    cost_usd = estimate_cost_usd(
-        model=model,
-        prompt_tokens=token_counts["prompt_tokens"],
-        completion_tokens=token_counts["completion_tokens"],
-        cache_read_tokens=token_counts["cache_read_tokens"],
-        cache_write_tokens=token_counts["cache_write_tokens"],
-    )
 
     metadata = {
         "cwd": payload.get("cwd"),
@@ -78,7 +70,6 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
         model=model,
         **token_counts,
         total_tokens=total_tokens,
-        cost_usd=cost_usd,
         metadata_json=json.dumps(metadata, separators=(",", ":")),
     )
 

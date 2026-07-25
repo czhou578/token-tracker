@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS usage_events (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER,
-    cost_usd REAL NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -51,7 +50,6 @@ INSERT_COLUMNS = (
     "reasoning_tokens",
     "total_tokens",
     "latency_ms",
-    "cost_usd",
     "metadata_json",
 )
 
@@ -70,6 +68,13 @@ class UsageDatabase:
     def init(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        # Drop the old cost_usd column from existing databases.
+        columns = connection.execute("PRAGMA table_info(usage_events)").fetchall()
+        if any(row["name"] == "cost_usd" for row in columns):
+            connection.execute("ALTER TABLE usage_events DROP COLUMN cost_usd")
 
     def insert_events(self, events: Iterable[UsageEvent]) -> int:
         rows = [_event_row(event) for event in events]
@@ -95,7 +100,6 @@ class UsageDatabase:
                     COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                     COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                     COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
-                    COALESCE(SUM(cost_usd), 0) AS cost_usd,
                     COUNT(*) AS requests,
                     COUNT(DISTINCT thread_id) AS threads,
                     COUNT(DISTINCT project) AS projects,
@@ -129,7 +133,6 @@ class UsageDatabase:
                     COALESCE(project, 'unknown') AS project,
                     COALESCE(model, 'unknown') AS model,
                     SUM(total_tokens) AS total_tokens,
-                    SUM(cost_usd) AS cost_usd,
                     COUNT(*) AS messages
                 FROM usage_events {where}
                 GROUP BY thread
@@ -148,7 +151,7 @@ class UsageDatabase:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT timestamp, project, provider, model, total_tokens, cost_usd, thread_id
+                SELECT timestamp, project, provider, model, total_tokens, thread_id
                 FROM usage_events {where}
                 ORDER BY timestamp DESC
                 LIMIT ?
@@ -170,7 +173,6 @@ class UsageDatabase:
                     SUM(total_tokens) AS total_tokens,
                     SUM(prompt_tokens) AS prompt_tokens,
                     SUM(completion_tokens) AS completion_tokens,
-                    SUM(cost_usd) AS cost_usd,
                     COUNT(*) AS requests,
                     COUNT(DISTINCT thread_id) AS threads,
                     AVG(latency_ms) AS average_latency_ms

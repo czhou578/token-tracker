@@ -29,7 +29,6 @@ class UsageEvent(BaseModel):
     reasoning_tokens: int = 0
     total_tokens: int = 0
     latency_ms: int | None = None
-    cost_usd: float = 0.0
     metadata_json: str = "{}"
 
     def normalized(self) -> "UsageEvent":
