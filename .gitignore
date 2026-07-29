@@ -1,4 +1,27 @@
-/tokentracker/*/__pycache__/
-/tokentracker/__pycache__/
+/# Byte-compiled / optimized / compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+
+# Package build artifacts
 tokentracker.egg-info/
-/tests/__pycache__
+build/
+dist/
+
+# Testing cache
+.pytest_cache/
+.coverage*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

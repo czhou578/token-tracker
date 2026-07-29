@@ -29,7 +29,6 @@ def test_parse_claude_record_extracts_usage() -> None:
     assert event.thread_id == "message-1"
     assert event.project == "project"
     assert event.total_tokens == 132
-    assert event.cost_usd > 0
 
 
 def test_parse_claude_record_ignores_records_without_usage() -> None:

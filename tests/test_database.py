@@ -18,7 +18,6 @@ def test_database_inserts_idempotently_and_aggregates(tmp_path) -> None:
         prompt_tokens=10,
         completion_tokens=5,
         total_tokens=15,
-        cost_usd=0.001,
     )
 
     assert database.insert_events([event]) == 1

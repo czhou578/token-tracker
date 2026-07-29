@@ -106,6 +106,5 @@ def _project_from_path(path: Path, root: Path) -> str:
     try:
         relative = path.relative_to(root)
     except ValueError:
-        relative = path.name
-        return str(relative)
+        return str(path.name)
     return relative.parts[0] if relative.parts else path.stem

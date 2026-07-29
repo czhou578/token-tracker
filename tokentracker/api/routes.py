@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, Query
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
 
+__all__ = ["router"]
+
 router = APIRouter()
 
 
@@ -30,15 +32,14 @@ def _filters(
     }
 
 
-# Map of endpoint name → database method name
-# Each entry produces a route that calls db.<method>(**filters)
-_ROUTE_METHODS: dict[str, str] = {
-    "stats": "stats",
-    "daily": "daily",
-    "models": "models",
-    "projects": "projects",
-    "threads": "threads",
-    "timeline": "timeline",
+# Endpoints to auto-register (route name = database method name)
+_ROUTE_METHODS = {
+    "stats",
+    "daily",
+    "models",
+    "projects",
+    "threads",
+    "timeline",
 }
 
 

@@ -68,13 +68,6 @@ class UsageDatabase:
     def init(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
-            self._migrate(connection)
-
-    def _migrate(self, connection: sqlite3.Connection) -> None:
-        # Drop the old cost_usd column from existing databases.
-        columns = connection.execute("PRAGMA table_info(usage_events)").fetchall()
-        if any(row["name"] == "cost_usd" for row in columns):
-            connection.execute("ALTER TABLE usage_events DROP COLUMN cost_usd")
 
     def insert_events(self, events: Iterable[UsageEvent]) -> int:
         rows = [_event_row(event) for event in events]
@@ -83,7 +76,7 @@ class UsageDatabase:
         with self.connect() as connection:
             before = connection.total_changes
             connection.executemany(
-                _insert_sql(),
+                _INSERT_SQL,
                 rows,
             )
             return connection.total_changes - before
@@ -205,10 +198,10 @@ class UsageDatabase:
         return "WHERE " + " AND ".join(clauses), tuple(values)
 
 
-def _insert_sql() -> str:
-    columns = ", ".join(INSERT_COLUMNS)
-    placeholders = ", ".join("?" for _ in INSERT_COLUMNS)
-    return f"INSERT OR IGNORE INTO usage_events ({columns}) VALUES ({placeholders})"
+_INSERT_SQL = f"""
+INSERT OR IGNORE INTO usage_events ({", ".join(INSERT_COLUMNS)})
+VALUES ({", ".join("?" for _ in INSERT_COLUMNS)})
+"""
 
 
 def _event_row(event: UsageEvent) -> tuple[Any, ...]:
