@@ -7,7 +7,6 @@ const ids = {
   dailyRange: document.querySelector("#dailyRange"),
   modelsChart: document.querySelector("#modelsChart"),
   projectsChart: document.querySelector("#projectsChart"),
-  recentRows: document.querySelector("#recentRows"),
   window: document.querySelector("#window"),
   refresh: document.querySelector("#refresh"),
 };
@@ -33,7 +32,6 @@ async function load() {
   renderDaily(daily);
   renderBars(ids.modelsChart, models, "model");
   renderBars(ids.projectsChart, projects, "project");
-  renderRecent(stats.recent || []);
 }
 
 function renderStats(stats) {
@@ -81,25 +79,6 @@ function renderBars(target, rows, labelKey) {
       <strong>${fmt.format(row.total_tokens || 0)}</strong>
     `;
     target.appendChild(item);
-  });
-}
-
-function renderRecent(rows) {
-  ids.recentRows.innerHTML = "";
-  if (!rows.length) {
-    ids.recentRows.innerHTML = '<tr><td colspan="5">No usage events found yet</td></tr>';
-    return;
-  }
-  rows.forEach((row) => {
-    const tr = document.createElement("tr");
-    const date = row.timestamp ? new Date(row.timestamp).toLocaleString() : "";
-    tr.innerHTML = `
-      <td>${escapeHtml(date)}</td>
-      <td>${escapeHtml(row.project || "unknown")}</td>
-      <td>${escapeHtml(row.model || "unknown")}</td>
-      <td>${fmt.format(row.total_tokens || 0)}</td>
-    `;
-    ids.recentRows.appendChild(tr);
   });
 }
 

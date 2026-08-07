@@ -147,11 +147,6 @@ button {
 .fill { height: 100%; background: var(--accent-2); }
 .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid var(--line); }
-th { color: var(--muted); font-weight: 600; }
-td:last-child, th:last-child, td:nth-last-child(2), th:nth-last-child(2) { text-align: right; }
-
 .empty {
   min-height: 160px;
   display: grid;
@@ -166,5 +161,4 @@ td:last-child, th:last-child, td:nth-last-child(2), th:nth-last-child(2) { text-
   select, button { flex: 1; }
   .cards, .grid { grid-template-columns: 1fr; }
   .wide { grid-column: auto; }
-  table { display: block; overflow-x: auto; }
 }

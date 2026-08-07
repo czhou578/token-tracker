@@ -6,21 +6,31 @@ from pathlib import Path
 
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
-from tokentracker.collector.parser import parse_claude_jsonl
+from tokentracker.collector.parser import parse_claude_jsonl, parse_cline_sqlite, parse_cline_task_history
 
 
 class Collector:
-    def __init__(self, root: Path | None = None):
+    def __init__(
+        self,
+        root: Path | None = None,
+        cline_db: Path | None = None,
+        cline_task_history: Path | None = None,
+    ):
         self.settings = get_settings()
         self.root = root or self.settings.claude_dir
+        self.cline_db = cline_db or self.settings.cline_db
+        self.cline_task_history = cline_task_history or self.settings.cline_task_history
         self.database = UsageDatabase(self.settings.db_path)
 
     def scan_once(self) -> int:
-        if not self.root.exists():
-            return 0
         inserted = 0
-        for path in self.root.rglob("*.jsonl"):
-            inserted += self.database.insert_events(parse_claude_jsonl(path, self.root))
+        if self.root.exists():
+            for path in self.root.rglob("*.jsonl"):
+                inserted += self.database.insert_events(parse_claude_jsonl(path, self.root))
+        if self.cline_db is not None and self.cline_db.exists():
+            inserted += self.database.insert_events(parse_cline_sqlite(self.cline_db))
+        if self.cline_task_history is not None and self.cline_task_history.exists():
+            inserted += self.database.insert_events(parse_cline_task_history(self.cline_task_history))
         return inserted
 
     def run_forever(self) -> None:
@@ -36,12 +46,3 @@ class Collector:
         while running:
             self.scan_once()
             time.sleep(self.settings.poll_seconds)
-
-
-def main() -> None:
-    """Entry point for `python -m tokentracker.collector.service` (systemd service)."""
-    Collector().run_forever()
-
-
-if __name__ == "__main__":
-    main()
