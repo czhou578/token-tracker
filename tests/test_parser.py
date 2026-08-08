@@ -10,6 +10,7 @@ from tokentracker.collector.parser import (
     parse_cline_record,
     parse_cline_sqlite,
     parse_cline_task_history,
+    parse_hermes_state_db,
 )
 
 
@@ -172,3 +173,57 @@ def test_parse_cline_task_history_extracts_usage(tmp_path) -> None:
 
 def test_parse_cline_task_history_skips_missing_file(tmp_path) -> None:
     assert list(parse_cline_task_history(tmp_path / "nope.json")) == []
+
+
+def test_parse_hermes_state_db_reads_finished_sessions(tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT,
+            started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT,
+            input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER, reasoning_tokens INTEGER
+        )"""
+    )
+    connection.execute(
+        """INSERT INTO sessions (id, source, model, title, started_at, ended_at, cwd, git_repo_root,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "20260807_182535_554eb9", "cli", "deepseek-v4-flash", "my session",
+            1785782943.608, 1785783000.0, "/home/colin-spark/Projects/blog",
+            "/home/colin-spark/Projects/blog", 100, 20, 5, 7, 3,
+        ),
+    )
+    # In-progress session (ended_at NULL) must be skipped.
+    connection.execute(
+        """INSERT INTO sessions (id, source, model, started_at, ended_at, cwd, git_repo_root,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("live_session", "cli", "deepseek-v4-flash", 1785782943.608, None,
+         "/tmp/x", "/tmp/x", 999, 999, 0, 0, 0),
+    )
+    connection.commit()
+    connection.close()
+
+    events = list(parse_hermes_state_db(db_path))
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.provider == "hermes"
+    assert event.model == "deepseek-v4-flash"
+    assert event.thread_id == "20260807_182535_554eb9"
+    assert event.conversation_id == "20260807_182535_554eb9"
+    assert event.project == "blog"
+    assert event.prompt_tokens == 100
+    assert event.completion_tokens == 20
+    assert event.cache_read_tokens == 5
+    assert event.cache_write_tokens == 7
+    assert event.reasoning_tokens == 3
+    assert event.total_tokens == 135
+    assert event.timestamp == datetime(2026, 8, 3, 18, 49, 3, 608000, tzinfo=timezone.utc)
+
+
+def test_parse_hermes_state_db_skips_missing_file(tmp_path) -> None:
+    assert list(parse_hermes_state_db(tmp_path / "nope.db")) == []

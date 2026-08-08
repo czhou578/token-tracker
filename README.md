@@ -4,9 +4,9 @@
 
 
 
-A zero-configuration local token usage tracker for Claude Code and Cline.
+A zero-configuration local token usage tracker for Claude Code, Cline, and Hermes.
 
-Token Tracker watches Claude Code JSONL session logs and Cline's SQLite message database / `taskHistory.json`, stores usage events in a local SQLite database, and serves a lightweight analytics dashboard from `localhost`.
+Token Tracker watches Claude Code JSONL session logs, Cline's SQLite message database / `taskHistory.json`, and Hermes' SQLite state database, stores usage events in a local SQLite database, and serves a lightweight analytics dashboard from `localhost`.
 
 ## Install
 
@@ -52,6 +52,12 @@ Cline (VS Code extension or CLI) stores its conversation history in a SQLite dat
 Cline 4.x additionally stores per-task token aggregates in `state/taskHistory.json` inside its `globalStorage` directory (VS Code `globalStorage` or VS Code Server `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev`). Each record carries `tokensIn`, `tokensOut`, `cacheReads`, `cacheWrites`, `modelId`, and a millisecond `ts` timestamp. Token Tracker auto-discovers this file too; override with `TOKEN_TRACKER_CLINE_TASK_HISTORY` to point at a specific one.
 
 Both Claude Code and Cline usage is aggregated together and labelled by the `provider` field (`claude` / `cline`).
+
+## Hermes
+
+Hermes stores each conversation and its aggregate token usage in a SQLite state database at `~/.hermes/state.db`. Token Tracker reads the `sessions` table and ingests finished conversations (those with an `ended_at` timestamp); in-progress sessions are picked up once they close. To point at a specific file, set `TOKEN_TRACKER_HERMES_DB` to the path of the state database.
+
+Hermes usage is labelled with `provider = "hermes"` and aggregated alongside Claude Code and Cline.
 
 ## Background Collection
 

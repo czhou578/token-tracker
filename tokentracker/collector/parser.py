@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from tokentracker.collector.config import CLAUDE_PROVIDER, CLINE_PROVIDER
+from tokentracker.collector.config import CLAUDE_PROVIDER, CLINE_PROVIDER, HERMES_PROVIDER
 from tokentracker.collector.models import UsageEvent
 
 
@@ -209,6 +209,84 @@ def parse_cline_task_history(path: Path) -> Iterable[UsageEvent]:
             **token_counts,
             total_tokens=total_tokens,
         )
+
+
+def parse_hermes_state_db(path: Path) -> Iterable[UsageEvent]:
+    """Parse Hermes token usage from `~/.hermes/state.db` (SQLite).
+
+    Each row in the `sessions` table is one finished conversation with its
+    aggregate token usage — the analog to Cline's `taskHistory.json`.
+    In-progress sessions (ended_at IS NULL) are skipped because their counts
+    are still changing and the usage database dedupes by `source_id`.
+    """
+    if not path.is_file():
+        return
+    connection = sqlite3.connect(str(path))
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = list(
+            connection.execute(
+                "SELECT id, source, model, title, started_at, ended_at, cwd, git_repo_root, "
+                "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens "
+                "FROM sessions WHERE ended_at IS NOT NULL"
+            )
+        )
+    except sqlite3.Error:
+        return
+    finally:
+        connection.close()
+
+    for row in rows:
+        event = _hermes_record(row)
+        if event is not None:
+            yield event
+
+
+def _hermes_record(row: sqlite3.Row) -> UsageEvent | None:
+    token_counts = {
+        "prompt_tokens": _int(row["input_tokens"]),
+        "completion_tokens": _int(row["output_tokens"]),
+        "cache_read_tokens": _int(row["cache_read_tokens"]),
+        "cache_write_tokens": _int(row["cache_write_tokens"]),
+        "reasoning_tokens": _int(row["reasoning_tokens"]),
+    }
+    total_tokens = sum(token_counts.values())
+    if total_tokens == 0:
+        return None
+
+    started = row["started_at"]
+    if isinstance(started, (int, float)) and started:
+        try:
+            timestamp = datetime.fromtimestamp(started, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            timestamp = datetime.now(timezone.utc)
+    else:
+        timestamp = _parse_timestamp(started)
+
+    thread_id = str(row["id"])
+    model = str(row["model"] or "unknown")
+    project = _project_from_cwd(row["git_repo_root"] or row["cwd"])
+
+    metadata = {
+        "title": row["title"],
+        "source": row["source"],
+        "cwd": row["cwd"],
+        "git_repo_root": row["git_repo_root"],
+        "ended_at": row["ended_at"],
+    }
+
+    return UsageEvent(
+        source_id=f"hermes:{thread_id}",
+        timestamp=timestamp,
+        thread_id=thread_id,
+        conversation_id=thread_id,
+        project=project,
+        provider=HERMES_PROVIDER,
+        model=model,
+        **token_counts,
+        total_tokens=total_tokens,
+        metadata_json=json.dumps(metadata),
+    )
 
 
 def _extract_cline_usage(payload: dict) -> object:

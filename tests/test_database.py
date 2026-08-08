@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
 from tokentracker.collector.models import UsageEvent
 
@@ -30,3 +31,11 @@ def test_database_inserts_idempotently_and_aggregates(tmp_path) -> None:
 
     assert database.projects()[0]["project"] == "project"
     assert database.models()[0]["model"] == "claude-3-5-sonnet"
+
+
+def test_hermes_db_env_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TOKEN_TRACKER_HERMES_DB", str(tmp_path / "custom.db"))
+
+    settings = get_settings()
+
+    assert settings.hermes_db == tmp_path / "custom.db"
