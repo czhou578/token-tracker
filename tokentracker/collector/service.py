@@ -55,3 +55,11 @@ class Collector:
         while running:
             self.scan_once()
             time.sleep(self.settings.poll_seconds)
+
+def main() -> None:
+    """Run the collector as a standalone background process (systemd user service entry)."""
+    Collector().run_forever()
+
+
+if __name__ == "__main__":
+    main()

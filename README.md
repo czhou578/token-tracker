@@ -30,7 +30,14 @@ pip install -e .
 tracker
 ```
 
-This starts the local dashboard server if needed and opens the dashboard in your browser. 
+This starts the local dashboard server if needed and opens the dashboard in your browser.
+
+The `tracker` command works from **any working directory** (the package is installed in site-packages), and so does the module form — handy when the venv's `bin` isn't on `PATH`:
+
+```bash
+python -m tokentracker.cli.cli dashboard
+python -m tokentracker dashboard
+```
 
 Useful commands:
 
@@ -61,11 +68,16 @@ Hermes usage is labelled with `provider = "hermes"` and aggregated alongside Cla
 
 ## Background Collection
 
-On Linux, install a user service:
+On Linux with systemd, install and start a per-user service that runs the collector in the background:
 
 ```bash
 tracker install-service
-systemctl --user enable --now tokentracker
 ```
 
-The service runs the collector in the background. The dashboard API is started on demand by `tracker dashboard`.
+This writes `~/.config/systemd/user/tokentracker.service` (respecting `XDG_CONFIG_HOME`), runs `systemctl --user daemon-reload`, and enables/starts the unit. The unit execs `python -m tokentracker.collector.service`, which loops over `scan_once()` every `TOKEN_TRACKER_POLL_SECONDS` (default 2 s). Stop and remove it with:
+
+```bash
+tracker uninstall-service
+```
+
+The dashboard API is started on demand by `tracker dashboard`.
