@@ -1,9 +1,9 @@
 // Token Tracker home-screen widget for iOS, run by the Scriptable app.
 //
-// Shows today's and the last seven days' estimated cost, tokens and requests,
-// read from the dashboard's JSON API over Tailscale. Tapping the widget opens
-// the dashboard. When the phone cannot reach the Spark (Tailscale off), the
-// widget keeps showing the last numbers it fetched and says how old they are.
+// Shows today's estimated cost, tokens and requests, read from the dashboard's
+// JSON API over Tailscale. Tapping the widget opens the dashboard. When the
+// phone cannot reach the Spark (Tailscale off), the widget keeps showing the
+// last numbers it fetched and says how old they are.
 //
 // Setup:
 //   1. Install Scriptable from the App Store and open it once.
@@ -35,8 +35,8 @@ const TAP_REFRESHES = (args.widgetParameter || "").trim().toLowerCase() === "ref
 const fm = FileManager.local();
 const cachePath = fm.joinPath(fm.documentsDirectory(), "tokentracker-widget.json");
 
-async function fetchStats(window) {
-  const params = [`window=${encodeURIComponent(window)}`];
+async function fetchToday() {
+  const params = ["window=today"];
   if (HOST) params.push(`host=${encodeURIComponent(HOST)}`);
   if (TIME_ZONE) params.push(`tz=${encodeURIComponent(TIME_ZONE)}`);
   const request = new Request(`${BASE_URL}/api/stats?${params.join("&")}`);
@@ -46,8 +46,7 @@ async function fetchStats(window) {
 
 async function loadData() {
   try {
-    const [today, week] = await Promise.all([fetchStats("today"), fetchStats("7d")]);
-    const data = { today, week, fetchedAt: Date.now(), live: true };
+    const data = { today: await fetchToday(), fetchedAt: Date.now(), live: true };
     fm.writeString(cachePath, JSON.stringify(data));
     return data;
   } catch (error) {
@@ -89,10 +88,16 @@ function addLine(stack, text, size, color, weight) {
   return line;
 }
 
-function addBlock(stack, label, stats, large) {
-  addLine(stack, label, 11, Color.gray());
-  addLine(stack, stats ? money(stats.cost_usd) : "—", large ? 26 : 20, Color.white(), "bold");
-  addLine(stack, stats ? `${count(stats.total_tokens)} tokens · ${count(stats.requests)} req` : "no data", 11, Color.lightGray());
+const LABEL_COLOR = new Color("#b4bcc6"); // light enough to read on the dark background
+
+// One stat on one row: a bold white number, then its unit in the label colour.
+function addStat(stack, value, unit, size) {
+  const row = stack.addStack();
+  row.layoutHorizontally();
+  row.bottomAlignContent();
+  addLine(row, value, size, Color.white(), "bold");
+  row.addSpacer(4);
+  addLine(row, unit, Math.round(size * 0.75), LABEL_COLOR);
 }
 
 function buildWidget(data) {
@@ -110,20 +115,31 @@ function buildWidget(data) {
   widget.addSpacer(6);
 
   const medium = config.widgetFamily === "medium" || config.widgetFamily === "large";
+  const stats = data.today;
+  const cost = stats ? money(stats.cost_usd) : "—";
+  const tokens = stats ? count(stats.total_tokens) : "—";
+  const requests = stats ? count(stats.requests) : "—";
   if (medium) {
     const row = widget.addStack();
     row.layoutHorizontally();
+    row.centerAlignContent();
     const left = row.addStack();
     left.layoutVertically();
-    addBlock(left, "Today", data.today, true);
+    addLine(left, "Today", 12, LABEL_COLOR);
+    addLine(left, cost, 34, Color.white(), "bold");
     row.addSpacer();
     const right = row.addStack();
     right.layoutVertically();
-    addBlock(right, "Last 7 days", data.week, true);
+    addStat(right, tokens, "tokens", 20);
+    right.addSpacer(6);
+    addStat(right, requests, "requests", 20);
   } else {
-    addBlock(widget, "Today", data.today, false);
-    widget.addSpacer(4);
-    addBlock(widget, "7 days", data.week, false);
+    addLine(widget, "Today", 11, LABEL_COLOR);
+    addLine(widget, cost, 26, Color.white(), "bold");
+    widget.addSpacer(6);
+    addStat(widget, tokens, "tokens", 16);
+    widget.addSpacer(2);
+    addStat(widget, requests, "requests", 16);
   }
 
   widget.addSpacer();
@@ -134,7 +150,7 @@ function buildWidget(data) {
       : "offline · turn on Tailscale";
   const note = widget.addText(footer);
   note.font = Font.systemFont(9);
-  note.textColor = data.live ? Color.gray() : new Color("#f2bd5e");
+  note.textColor = data.live ? LABEL_COLOR : new Color("#f2bd5e");
   note.lineLimit = 1;
   return widget;
 }
