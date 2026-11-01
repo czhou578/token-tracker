@@ -13,6 +13,7 @@ from tokentracker.collector.parser import (
     parse_cline_task_history,
     parse_hermes_state_db,
 )
+from tokentracker.collector.forwarder import Forwarder
 from tokentracker.collector.pricing import Pricing
 
 log = logging.getLogger("tokentracker.collector")
@@ -52,7 +53,8 @@ class Collector:
         self.cline_db = cline_db or self.settings.cline_db
         self.cline_task_history = cline_task_history or self.settings.cline_task_history
         self.hermes_db = hermes_db or self.settings.hermes_db
-        self.database = UsageDatabase(self.settings.db_path)
+        self.database = UsageDatabase(self.settings.db_path, hostname=self.settings.hostname)
+        self.forwarder = Forwarder(self.settings, self.database)
         self.pricing_file = self.settings.pricing_file
         self.pricing = Pricing.load(self.pricing_file)
         # Change markers so each poll re-parses only the files that changed.
@@ -62,17 +64,24 @@ class Collector:
 
     def scan_once(self) -> int:
         self._refresh_pricing()
-        price = self.pricing.price_events
+        prepare = self._prepare
         inserted = self._scan_claude()
         if self._changed(self._sources, self.cline_db):
-            inserted += self.database.insert_events(price(parse_cline_sqlite(self.cline_db)))
+            inserted += self.database.insert_events(prepare(parse_cline_sqlite(self.cline_db)))
         if self._changed(self._sources, self.cline_task_history):
-            inserted += self.database.insert_events(price(parse_cline_task_history(self.cline_task_history)))
+            inserted += self.database.insert_events(prepare(parse_cline_task_history(self.cline_task_history)))
         if self._changed(self._sources, self.hermes_db):
             # Hermes rows are per-session aggregates that grow while the session
             # is open, so refresh existing rows instead of ignoring them.
-            inserted += self.database.upsert_events(price(parse_hermes_state_db(self.hermes_db)))
+            inserted += self.database.upsert_events(prepare(parse_hermes_state_db(self.hermes_db)))
+        self.forwarder.flush()
         return inserted
+
+    def _prepare(self, events):
+        """Price each event and stamp it with this machine's name."""
+        hostname = self.settings.hostname
+        for event in self.pricing.price_events(events):
+            yield event if event.host else event.model_copy(update={"host": hostname})
 
     def reprice(self) -> int:
         """Recompute every stored cost with the current pricing table."""
@@ -101,7 +110,7 @@ class Collector:
         for path in self.root.rglob("*.jsonl"):
             present.add(path)
             if self._changed(self._claude_files, path):
-                inserted += self.database.insert_events(self.pricing.price_events(parse_claude_jsonl(path, self.root)))
+                inserted += self.database.insert_events(self._prepare(parse_claude_jsonl(path, self.root)))
         for stale in [path for path in self._claude_files if path not in present]:
             del self._claude_files[stale]
         return inserted
@@ -130,8 +139,9 @@ class Collector:
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
 
-        log.info("collector started: claude=%s hermes=%s cline=%s db=%s",
-                 self.root, self.hermes_db, self.cline_db or self.cline_task_history, self.database.path)
+        log.info("collector started on %s: claude=%s hermes=%s cline=%s db=%s remote=%s",
+                 self.settings.hostname, self.root, self.hermes_db, self.cline_db or self.cline_task_history,
+                 self.database.path, self.settings.remote_url or "off")
         # Apply the current rate table to history, so a code update with new
         # rates or a first run after the cost column was added is reflected.
         try:

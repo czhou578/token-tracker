@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -47,6 +50,45 @@ class Settings:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     poll_seconds: float = 2.0
+    # Multi-machine settings (see ~/.tokentracker/config.json and `tracker link`).
+    hostname: str = ""
+    config_file: Path | None = None
+    ingest_token_file: Path | None = None
+    remote_url: str | None = None
+    remote_token: str | None = None
+    project_labels: str = "clear"  # "clear" | "hash": how project names are sent to the remote
+    project_salt: str = ""
+
+
+CONFIG_KEYS = ("host_label", "remote_url", "remote_token", "project_labels", "project_salt")
+
+
+def load_config(data_dir: Path) -> dict[str, Any]:
+    """Read ~/.tokentracker/config.json; missing or invalid files count as empty."""
+    path = data_dir / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(data_dir: Path, **updates: Any) -> Path:
+    """Merge *updates* into config.json (a None value removes the key) and return its path."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data = load_config(data_dir)
+    for key, value in updates.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    path = data_dir / "config.json"
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
 
 
 def get_settings() -> Settings:
@@ -58,7 +100,16 @@ def get_settings() -> Settings:
     pricing_file = _env_path("TOKEN_TRACKER_PRICING") or data_dir / "pricing.json"
     port = int(os.environ.get("TOKEN_TRACKER_PORT", DEFAULT_PORT))
     poll_seconds = float(os.environ.get("TOKEN_TRACKER_POLL_SECONDS", "2"))
+    config = load_config(data_dir)
+    remote_url = os.environ.get("TOKEN_TRACKER_REMOTE_URL") or config.get("remote_url") or None
     return Settings(
+        hostname=os.environ.get("TOKEN_TRACKER_HOSTNAME") or config.get("host_label") or socket.gethostname(),
+        config_file=data_dir / "config.json",
+        ingest_token_file=_env_path("TOKEN_TRACKER_INGEST_TOKEN_FILE") or data_dir / "ingest_token",
+        remote_url=remote_url.rstrip("/") if remote_url else None,
+        remote_token=os.environ.get("TOKEN_TRACKER_REMOTE_TOKEN") or config.get("remote_token") or None,
+        project_labels=os.environ.get("TOKEN_TRACKER_PROJECT_LABELS") or config.get("project_labels") or "clear",
+        project_salt=str(config.get("project_salt") or ""),
         data_dir=data_dir,
         db_path=data_dir / "usage.db",
         claude_dir=claude_dir,

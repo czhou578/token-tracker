@@ -21,6 +21,7 @@ class UsageEvent(BaseModel):
     conversation_id: str | None = None
     project: str | None = None
     provider: str = "claude"
+    host: str | None = None
     model: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0

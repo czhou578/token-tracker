@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -10,20 +11,44 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 
-from tokentracker.collector.config import Settings, get_settings
+from tokentracker.collector.config import Settings, get_settings, save_config
 from tokentracker.collector.database import UsageDatabase
+from tokentracker.collector.forwarder import META_LAST_ERROR, META_LAST_OK
 from tokentracker.collector.pricing import PRICING_SOURCE_DATE, Pricing
 from tokentracker.collector.service import Collector
 
 app = typer.Typer(help="Token Tracker: local token analytics for AI coding sessions.")
 
-SERVICE_NAME = "tokentracker.service"
-LAUNCHD_LABEL = "com.tokentracker.collector"
-COLLECTOR_MODULE = "tokentracker.collector.service"
+
+@dataclass(frozen=True)
+class Service:
+    key: str
+    description: str
+    module: str
+    unit: str  # systemd unit name
+    label: str  # launchd label
+
+
+COLLECTOR = Service(
+    "collector", "Token Tracker background collector",
+    "tokentracker.collector.service", "tokentracker.service", "com.tokentracker.collector",
+)
+DASHBOARD = Service(
+    "dashboard", "Token Tracker dashboard and ingest API",
+    "tokentracker.api.main", "tokentracker-dashboard.service", "com.tokentracker.dashboard",
+)
+SERVICES = (COLLECTOR, DASHBOARD)
+
+# Kept for callers and tests that refer to the collector unit by the old names.
+SERVICE_NAME = COLLECTOR.unit
+LAUNCHD_LABEL = COLLECTOR.label
+COLLECTOR_MODULE = COLLECTOR.module
 
 
 @app.callback(invoke_without_command=True)
@@ -53,7 +78,7 @@ def _ensure_server(url: str, settings: Settings | None = None) -> None:
     log_file = settings.data_dir / "server.log"
     with log_file.open("ab") as log:
         subprocess.Popen(
-            [sys.executable, "-m", "tokentracker.api.main"],
+            [sys.executable, "-m", DASHBOARD.module],
             stdout=log,
             stderr=log,
             start_new_session=True,
@@ -75,7 +100,7 @@ def _is_healthy(url: str) -> bool:
         return False
 
 
-# ── background service: shared ───────────────────────────────────────────
+# ── background services: shared ─────────────────────────────────────────
 
 
 def _platform() -> str:
@@ -105,7 +130,7 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
 
 def _warn_if_fragile_interpreter() -> None:
-    """Warn when the service would run from a project virtual environment.
+    """Warn when the services would run from a project virtual environment.
 
     The unit records the absolute interpreter path. If that folder is deleted
     or recreated (for example by `uv sync`), the service fails on every start.
@@ -113,7 +138,7 @@ def _warn_if_fragile_interpreter() -> None:
     parts = set(Path(sys.executable).parts)
     if parts & {".venv", "venv"}:
         typer.echo(
-            f"Warning: the service will run {sys.executable}, which lives in a project virtual "
+            f"Warning: the services will run {sys.executable}, which lives in a project virtual "
             "environment. If that folder is removed or recreated, the collector stops.\n"
             "For a persistent install run `uv tool install .` (or `pipx install .`) in the "
             "project folder, then run `tracker install-service` again from that `tracker`."
@@ -123,13 +148,13 @@ def _warn_if_fragile_interpreter() -> None:
 def _unsupported() -> None:
     typer.echo(
         "Background service install supports Linux (systemd) and macOS (launchd).\n"
-        f"On this platform, schedule this command to run at logon:\n"
-        f"  {sys.executable} -m {COLLECTOR_MODULE}"
+        "On this platform, schedule these commands to run at logon:\n"
+        + "\n".join(f"  {sys.executable} -m {service.module}" for service in SERVICES)
     )
     raise typer.Exit(1)
 
 
-# ── background service: systemd (Linux) ──────────────────────────────────
+# ── systemd (Linux) ──────────────────────────────────────────────────────
 
 
 def _systemd_user_dir() -> Path:
@@ -137,16 +162,16 @@ def _systemd_user_dir() -> Path:
     return base / "systemd" / "user"
 
 
-def _unit_file() -> str:
+def _unit_file(service: Service = COLLECTOR) -> str:
     python = shlex.quote(sys.executable)
     return (
         "[Unit]\n"
-        "Description=Token Tracker background collector\n"
+        f"Description={service.description}\n"
         "After=network.target\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart={python} -m {COLLECTOR_MODULE}\n"
+        f"ExecStart={python} -m {service.module}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
         "Environment=PYTHONUNBUFFERED=1\n"
@@ -168,26 +193,29 @@ def _install_systemd() -> None:
     systemctl = _find_systemctl()
     unit_dir = _systemd_user_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
-    unit_path = unit_dir / SERVICE_NAME
-    unit_path.write_text(_unit_file())
-    typer.echo(f"Wrote {unit_path}")
+    for service in SERVICES:
+        unit_path = unit_dir / service.unit
+        unit_path.write_text(_unit_file(service))
+        typer.echo(f"Wrote {unit_path}")
     _systemctl(systemctl, ["daemon-reload"])
-    _systemctl(systemctl, ["reset-failed", SERVICE_NAME], check=False)
-    _systemctl(systemctl, ["enable", SERVICE_NAME])
-    _systemctl(systemctl, ["restart", SERVICE_NAME])
+    for service in SERVICES:
+        _systemctl(systemctl, ["reset-failed", service.unit], check=False)
+        _systemctl(systemctl, ["enable", service.unit])
+        _systemctl(systemctl, ["restart", service.unit])
 
 
 def _uninstall_systemd() -> None:
     systemctl = _find_systemctl()
-    _systemctl(systemctl, ["stop", SERVICE_NAME], check=False)
-    _systemctl(systemctl, ["disable", SERVICE_NAME], check=False)
-    unit_path = _systemd_user_dir() / SERVICE_NAME
-    if unit_path.exists():
-        unit_path.unlink()
+    for service in SERVICES:
+        _systemctl(systemctl, ["stop", service.unit], check=False)
+        _systemctl(systemctl, ["disable", service.unit], check=False)
+        unit_path = _systemd_user_dir() / service.unit
+        if unit_path.exists():
+            unit_path.unlink()
 
 
-def _systemd_state() -> tuple[str, str | None]:
-    unit_path = _systemd_user_dir() / SERVICE_NAME
+def _systemd_state(service: Service) -> tuple[str, str | None]:
+    unit_path = _systemd_user_dir() / service.unit
     if not unit_path.exists():
         return "not installed (run `tracker install-service`)", None
     interpreter = _exec_start_interpreter(unit_path.read_text())
@@ -196,7 +224,7 @@ def _systemd_state() -> tuple[str, str | None]:
         return "unknown (systemctl not found)", interpreter
     result = _systemctl(
         systemctl,
-        ["show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts", SERVICE_NAME],
+        ["show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts", service.unit],
         check=False,
     )
     values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -214,22 +242,22 @@ def _exec_start_interpreter(unit_text: str) -> str | None:
     return None
 
 
-# ── background service: launchd (macOS) ──────────────────────────────────
+# ── launchd (macOS) ──────────────────────────────────────────────────────
 
 
 def _launch_agents_dir() -> Path:
     return Path("~/Library/LaunchAgents").expanduser()
 
 
-def _plist_path() -> Path:
-    return _launch_agents_dir() / f"{LAUNCHD_LABEL}.plist"
+def _plist_path(service: Service = COLLECTOR) -> Path:
+    return _launch_agents_dir() / f"{service.label}.plist"
 
 
-def _plist_bytes(log_path: Path) -> bytes:
+def _plist_bytes(log_path: Path, service: Service = COLLECTOR) -> bytes:
     return plistlib.dumps(
         {
-            "Label": LAUNCHD_LABEL,
-            "ProgramArguments": [sys.executable, "-m", COLLECTOR_MODULE],
+            "Label": service.label,
+            "ProgramArguments": [sys.executable, "-m", service.module],
             "RunAtLoad": True,
             "KeepAlive": True,
             "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
@@ -251,26 +279,28 @@ def _install_launchd() -> None:
     launchctl = _find_launchctl()
     settings = get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    plist = _plist_path()
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    plist.write_bytes(_plist_bytes(settings.data_dir / "collector.log"))
-    typer.echo(f"Wrote {plist}")
-    target = f"{_launchd_domain()}/{LAUNCHD_LABEL}"
-    # Unload a previous copy first; bootstrap refuses to load a label twice.
-    _run([launchctl, "bootout", target], check=False)
-    _run([launchctl, "bootstrap", _launchd_domain(), str(plist)])
+    for service in SERVICES:
+        plist = _plist_path(service)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_bytes(_plist_bytes(settings.data_dir / f"{service.key}.log", service))
+        typer.echo(f"Wrote {plist}")
+        target = f"{_launchd_domain()}/{service.label}"
+        # Unload a previous copy first; bootstrap refuses to load a label twice.
+        _run([launchctl, "bootout", target], check=False)
+        _run([launchctl, "bootstrap", _launchd_domain(), str(plist)])
 
 
 def _uninstall_launchd() -> None:
     launchctl = _find_launchctl()
-    _run([launchctl, "bootout", f"{_launchd_domain()}/{LAUNCHD_LABEL}"], check=False)
-    plist = _plist_path()
-    if plist.exists():
-        plist.unlink()
+    for service in SERVICES:
+        _run([launchctl, "bootout", f"{_launchd_domain()}/{service.label}"], check=False)
+        plist = _plist_path(service)
+        if plist.exists():
+            plist.unlink()
 
 
-def _launchd_state() -> tuple[str, str | None]:
-    plist = _plist_path()
+def _launchd_state(service: Service) -> tuple[str, str | None]:
+    plist = _plist_path(service)
     if not plist.exists():
         return "not installed (run `tracker install-service`)", None
     try:
@@ -281,7 +311,7 @@ def _launchd_state() -> tuple[str, str | None]:
     launchctl = shutil.which("launchctl")
     if launchctl is None:
         return "unknown (launchctl not found)", interpreter
-    result = _run([launchctl, "print", f"{_launchd_domain()}/{LAUNCHD_LABEL}"], check=False)
+    result = _run([launchctl, "print", f"{_launchd_domain()}/{service.label}"], check=False)
     if result.returncode != 0:
         return "installed but not loaded", interpreter
     for line in result.stdout.splitlines():
@@ -290,12 +320,21 @@ def _launchd_state() -> tuple[str, str | None]:
     return "loaded", interpreter
 
 
+def _service_state(service: Service) -> tuple[str, str | None]:
+    platform = _platform()
+    if platform == "systemd":
+        return _systemd_state(service)
+    if platform == "launchd":
+        return _launchd_state(service)
+    return "background service not supported on this platform", None
+
+
 # ── commands ─────────────────────────────────────────────────────────────
 
 
 @app.command("install-service")
 def install_service() -> None:
-    """Install and start the background collector (systemd on Linux, launchd on macOS)."""
+    """Install and start the collector and dashboard services (systemd on Linux, launchd on macOS)."""
     _warn_if_fragile_interpreter()
     platform = _platform()
     if platform == "systemd":
@@ -304,12 +343,12 @@ def install_service() -> None:
         _install_launchd()
     else:
         _unsupported()
-    typer.echo("Token Tracker collector is running in the background.")
+    typer.echo("Token Tracker collector and dashboard are running in the background.")
 
 
 @app.command("uninstall-service")
 def uninstall_service() -> None:
-    """Stop and remove the background collector service."""
+    """Stop and remove the background services."""
     platform = _platform()
     if platform == "systemd":
         _uninstall_systemd()
@@ -317,31 +356,25 @@ def uninstall_service() -> None:
         _uninstall_launchd()
     else:
         _unsupported()
-    typer.echo("Token Tracker collector service removed.")
+    typer.echo("Token Tracker services removed.")
 
 
 @app.command()
 def status() -> None:
-    """Show the collector state, its interpreter, and the newest event per source."""
+    """Show service state, interpreter, remote link, and the newest event per source."""
     settings = get_settings()
-    platform = _platform()
-    if platform == "systemd":
-        state, interpreter = _systemd_state()
-    elif platform == "launchd":
-        state, interpreter = _launchd_state()
-    else:
-        state, interpreter = "background service not supported on this platform", None
-
-    typer.echo(f"Collector:   {state}")
-    if interpreter is not None:
-        if Path(interpreter).exists():
-            note = "ok"
-        else:
-            note = "MISSING - reinstall the package and run `tracker install-service`"
-        typer.echo(f"Interpreter: {interpreter} ({note})")
+    typer.echo(f"Machine:     {settings.hostname}")
+    for service in SERVICES:
+        state, interpreter = _service_state(service)
+        typer.echo(f"{service.key.capitalize() + ':':<13}{state}")
+        if interpreter is not None and not Path(interpreter).exists():
+            typer.echo(f"  interpreter {interpreter} is MISSING - reinstall the package and run `tracker install-service`")
+    _, interpreter = _service_state(COLLECTOR)
+    if interpreter is not None and Path(interpreter).exists():
+        typer.echo(f"Interpreter: {interpreter} (ok)")
     typer.echo(f"Database:    {settings.db_path}")
 
-    database = UsageDatabase(settings.db_path)
+    database = UsageDatabase(settings.db_path, hostname=settings.hostname)
     migration = database.migration_info()
     if migration and migration.get("backup"):
         typer.echo(
@@ -352,6 +385,26 @@ def status() -> None:
     priced, requests = totals["priced_requests"], totals["requests"]
     coverage = f"{priced}/{requests} events priced" if requests else "no events"
     typer.echo(f"Est. cost:   ${totals['cost_usd']:,.2f} at list price ({coverage})")
+
+    token_file = settings.ingest_token_file
+    ingest = "enabled" if token_file is not None and token_file.is_file() else "disabled (run `tracker ingest-token` to enable)"
+    typer.echo(f"Ingest:      {ingest}")
+    if settings.remote_url:
+        pending = database.pending_forward_count()
+        last_ok = database.get_meta(META_LAST_OK)
+        last_error = database.get_meta(META_LAST_ERROR)
+        detail = f"{pending} pending"
+        if last_ok:
+            detail += f", last push {_ago(last_ok['at'])} ({last_ok['sent']} events)"
+        if last_error and (not last_ok or last_error["at"] > last_ok["at"]):
+            detail += f", last error {_ago(last_error['at'])}: {last_error['error']}"
+        typer.echo(f"Remote:      {settings.remote_url} ({detail})")
+    else:
+        typer.echo("Remote:      not linked (run `tracker link <url> --token <token>` on a second machine)")
+
+    hosts = database.hosts()
+    if len(hosts) > 1:
+        typer.echo("Machines:    " + ", ".join(f"{row['host'] or '?'} ({row['events']} events)" for row in hosts))
 
     latest = database.latest_by_provider()
     sources = (
@@ -367,12 +420,77 @@ def status() -> None:
         typer.echo(f"  {provider:<7} {path or '-'}  [{found}]  {last}")
 
 
+def _ago(epoch: float) -> str:
+    seconds = max(0, int(time.time() - epoch))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+@app.command("ingest-token")
+def ingest_token(rotate: bool = typer.Option(False, "--rotate", help="Replace an existing token.")) -> None:
+    """Enable ingest from other machines: create (or show) the shared bearer token."""
+    settings = get_settings()
+    path = settings.ingest_token_file
+    if path is None:
+        raise typer.Exit(1)
+    if path.is_file() and not rotate:
+        token = path.read_text(encoding="utf-8").strip()
+        typer.echo(f"Ingest token already exists at {path} (use --rotate to replace it):")
+    else:
+        token = secrets.token_urlsafe(32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(token + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        typer.echo(f"Wrote ingest token to {path}:")
+    typer.echo(f"  {token}")
+    typer.echo("On the other machine run:")
+    typer.echo(f"  tracker link https://<this-machine>/ --token {token}")
+
+
+@app.command()
+def link(
+    url: str = typer.Argument(..., help="Base URL of the main tracker, e.g. https://spark.tailxxxx.ts.net"),
+    token: str = typer.Option(..., "--token", help="Ingest token from `tracker ingest-token` on the main tracker."),
+    project_labels: str = typer.Option("hash", "--project-labels", help="'hash' (default) or 'clear' project names."),
+    host_label: str | None = typer.Option(None, "--host-label", help="Name shown for this machine (default: hostname)."),
+) -> None:
+    """Forward this machine's usage to a main tracker. Settings are saved in config.json."""
+    if project_labels not in ("hash", "clear"):
+        typer.echo("--project-labels must be 'hash' or 'clear'")
+        raise typer.Exit(1)
+    settings = get_settings()
+    path = save_config(
+        settings.data_dir,
+        remote_url=url.rstrip("/"),
+        remote_token=token,
+        project_labels=project_labels,
+        project_salt=settings.project_salt or secrets.token_hex(8),
+        host_label=host_label,
+    )
+    typer.echo(f"Saved remote link in {path}.")
+    typer.echo("Restart the collector to start forwarding: tracker install-service")
+
+
+@app.command()
+def unlink() -> None:
+    """Stop forwarding usage to a main tracker."""
+    settings = get_settings()
+    save_config(settings.data_dir, remote_url=None, remote_token=None)
+    typer.echo("Remote link removed. Restart the collector: tracker install-service")
+
+
 @app.command()
 def reprice() -> None:
     """Recompute the cost estimate of every stored event with the current rate table."""
     settings = get_settings()
     pricing = Pricing.load(settings.pricing_file)
-    changed = UsageDatabase(settings.db_path).reprice(pricing)
+    changed = UsageDatabase(settings.db_path, hostname=settings.hostname).reprice(pricing)
     typer.echo(f"Repriced {changed} events ({_pricing_origin(settings, pricing)}).")
 
 
@@ -389,7 +507,7 @@ def pricing() -> None:
             f"{rates.get('cache_read', 0):>9.4f} {rates.get('cache_write_5m', 0):>9.4f} "
             f"{rates.get('cache_write_1h', 0):>9.4f}"
         )
-    unpriced = UsageDatabase(settings.db_path).unpriced_models()
+    unpriced = UsageDatabase(settings.db_path, hostname=settings.hostname).unpriced_models()
     if unpriced:
         typer.echo("")
         typer.echo(f"Unpriced models (add a rate card to {settings.pricing_file} to estimate them):")

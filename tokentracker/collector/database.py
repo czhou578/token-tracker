@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     conversation_id TEXT,
     project TEXT,
     provider TEXT NOT NULL,
+    host TEXT,
     model TEXT,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     total_tokens INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER,
     cost_usd REAL,
+    synced INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -61,6 +64,7 @@ INSERT_COLUMNS = (
     "conversation_id",
     "project",
     "provider",
+    "host",
     "model",
     "prompt_tokens",
     "completion_tokens",
@@ -75,8 +79,9 @@ INSERT_COLUMNS = (
 
 
 class UsageDatabase:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, hostname: str | None = None):
         self.path = path
+        self.hostname = hostname or socket.gethostname()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
@@ -92,6 +97,12 @@ class UsageDatabase:
             if "cost_usd" not in columns:
                 # Databases created before cost estimates existed.
                 connection.execute("ALTER TABLE usage_events ADD COLUMN cost_usd REAL")
+            if "host" not in columns:
+                connection.execute("ALTER TABLE usage_events ADD COLUMN host TEXT")
+            if "synced" not in columns:
+                connection.execute("ALTER TABLE usage_events ADD COLUMN synced INTEGER NOT NULL DEFAULT 0")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_host ON usage_events(host)")
+            connection.execute("UPDATE usage_events SET host = ? WHERE host IS NULL", (self.hostname,))
         self._migrate_claude_duplicates()
 
     def _migrate_claude_duplicates(self) -> None:
@@ -140,6 +151,66 @@ class UsageDatabase:
         conversation, such as Hermes sessions.
         """
         return self._write(_UPSERT_SQL, events)
+
+    def ingest_events(self, host: str, events: Iterable[UsageEvent]) -> int:
+        """Store events pushed from another machine.
+
+        Their `source_id` is namespaced with the sending host so two machines
+        can never collide, and they are written with an upsert so a resend
+        (or a grown Hermes session) refreshes the row.
+        """
+        host = host.strip()
+        if not host:
+            return 0
+        stamped = (
+            event.model_copy(update={"host": host, "source_id": f"{host}::{event.source_id}"})
+            for event in events
+            if not event.source_id.startswith(f"{host}::")
+        )
+        return self._write(_UPSERT_SQL, stamped)
+
+    def hosts(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COALESCE(host, '') AS host, COUNT(*) AS events,
+                       SUM(total_tokens) AS total_tokens, MAX(timestamp) AS last_timestamp
+                FROM usage_events GROUP BY host ORDER BY total_tokens DESC
+                """
+            ).fetchall()
+        return _dicts(rows)
+
+    def pending_forward(self, limit: int = 500) -> list[tuple[int, UsageEvent]]:
+        """Local events not yet pushed to the remote tracker, oldest first."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id, {', '.join(INSERT_COLUMNS)} FROM usage_events "
+                "WHERE synced = 0 AND host = ? ORDER BY id LIMIT ?",
+                (self.hostname, limit),
+            ).fetchall()
+        return [(row["id"], _event_from_row(row)) for row in rows]
+
+    def pending_forward_count(self) -> int:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM usage_events WHERE synced = 0 AND host = ?", (self.hostname,)
+            ).fetchone()[0]
+
+    def mark_forwarded(self, ids: Iterable[int]) -> None:
+        ids = list(ids)
+        if not ids:
+            return
+        with self.connect() as connection:
+            connection.executemany("UPDATE usage_events SET synced = 1 WHERE id = ?", [(i,) for i in ids])
+
+    def set_meta(self, key: str, value: Any) -> None:
+        with self.connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+    def get_meta(self, key: str) -> Any:
+        with self.connect() as connection:
+            row = connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else None
 
     def _write(self, sql: str, events: Iterable[UsageEvent]) -> int:
         rows = [_event_row(event) for event in events]
@@ -270,7 +341,7 @@ class UsageDatabase:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT source_id, timestamp, project, provider, model, total_tokens, cost_usd, thread_id
+                SELECT source_id, timestamp, project, provider, host, model, total_tokens, cost_usd, thread_id
                 FROM usage_events {where}
                 ORDER BY timestamp DESC
                 LIMIT ?
@@ -316,7 +387,7 @@ class UsageDatabase:
         if until is not None:
             clauses.append("timestamp < ?")
             values.append(until.isoformat())
-        for key in ("project", "model", "thread_id", "provider"):
+        for key in ("project", "model", "thread_id", "provider", "host"):
             value = filters.get(key)
             if value:
                 clauses.append(f"{key} = ?")
@@ -339,7 +410,8 @@ _UPSERT_SQL = f"""
 INSERT INTO usage_events ({", ".join(INSERT_COLUMNS)})
 VALUES ({", ".join("?" for _ in INSERT_COLUMNS)})
 ON CONFLICT(source_id) DO UPDATE SET
-    {", ".join(f"{column} = excluded.{column}" for column in _UPDATE_COLUMNS)}
+    {", ".join(f"{column} = excluded.{column}" for column in _UPDATE_COLUMNS)},
+    synced = 0
 WHERE excluded.total_tokens != usage_events.total_tokens
    OR excluded.metadata_json != usage_events.metadata_json
    OR excluded.cost_usd IS NOT usage_events.cost_usd
@@ -349,6 +421,8 @@ WHERE excluded.total_tokens != usage_events.total_tokens
 def _event_row(event: UsageEvent) -> tuple[Any, ...]:
     event = event.normalized()
     values = event.model_dump()
+    if not values.get("host"):
+        values["host"] = None  # filled by the caller; NULL rows are stamped with the local hostname on init
     values["timestamp"] = event.timestamp.astimezone(timezone.utc).isoformat()
     return tuple(values[column] for column in INSERT_COLUMNS)
 

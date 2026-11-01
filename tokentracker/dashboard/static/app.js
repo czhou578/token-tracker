@@ -10,6 +10,7 @@ const ids = {
   modelsChart: document.querySelector("#modelsChart"),
   projectsChart: document.querySelector("#projectsChart"),
   window: document.querySelector("#window"),
+  host: document.querySelector("#host"),
   refresh: document.querySelector("#refresh"),
   costHelp: document.querySelector("#costHelp"),
   costDialog: document.querySelector("#costDialog"),
@@ -40,14 +41,33 @@ function money(value) {
 }
 
 async function get(path) {
-  const windowValue = ids.window.value;
-  const suffix = windowValue ? `?window=${encodeURIComponent(windowValue)}` : "";
-  const response = await fetch(`/api/${path}${suffix}`);
+  const params = new URLSearchParams();
+  if (ids.window.value) params.set("window", ids.window.value);
+  if (ids.host.value) params.set("host", ids.host.value);
+  const query = params.toString();
+  const response = await fetch(`/api/${path}${query ? `?${query}` : ""}`);
   if (!response.ok) throw new Error(`Failed to load ${path}`);
   return response.json();
 }
 
+async function loadHosts() {
+  const response = await fetch("/api/hosts");
+  if (!response.ok) return;
+  const hosts = (await response.json()).filter((row) => row.host);
+  const selected = ids.host.value;
+  ids.host.innerHTML = '<option value="">All machines</option>';
+  hosts.forEach((row) => {
+    const option = document.createElement("option");
+    option.value = row.host;
+    option.textContent = row.host;
+    ids.host.appendChild(option);
+  });
+  ids.host.value = hosts.some((row) => row.host === selected) ? selected : "";
+  ids.host.hidden = hosts.length < 2;
+}
+
 async function load() {
+  await loadHosts();
   const [stats, series, models, projects] = await Promise.all([
     get("stats"),
     get("series"),
@@ -189,6 +209,7 @@ function escapeHtml(value) {
 }
 
 ids.window.addEventListener("change", load);
+ids.host.addEventListener("change", load);
 ids.refresh.addEventListener("click", load);
 ids.costHelp.addEventListener("click", () => openCostHelp().catch(() => {}));
 ids.costClose.addEventListener("click", () => ids.costDialog.close());

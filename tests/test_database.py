@@ -248,3 +248,49 @@ def test_series_buckets_follow_the_window(tmp_path) -> None:
     assert sorted((row["period"], row["total_tokens"]) for row in weeks) == [("2026-10-05", 30), ("2026-10-12", 40), ("2026-10-26", 80)]
     days = database._grouped(BUCKET_EXPRESSIONS["day"], "period", {})
     assert len(days) == 4
+
+
+def test_host_column_is_stamped_and_filterable(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", hostname="spark")
+    database.insert_events([UsageEvent(source_id="a", provider="claude", prompt_tokens=5)])  # no host set
+    database.insert_events([UsageEvent(source_id="b", provider="claude", host="laptop", prompt_tokens=7)])
+    # Rows written without a host are stamped with the local hostname when the database is opened.
+    database = UsageDatabase(tmp_path / "usage.db", hostname="spark")
+    hosts = {row["host"]: row["total_tokens"] for row in database.hosts()}
+    assert hosts == {"spark": 5, "laptop": 7}
+    assert database.stats(host="laptop")["total_tokens"] == 7
+    assert database.stats()["total_tokens"] == 12
+
+
+def test_ingest_namespaces_source_ids_and_upserts(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", hostname="spark")
+    database.insert_events([UsageEvent(source_id="hermes:1", provider="hermes", prompt_tokens=100)])
+    remote = [UsageEvent(source_id="hermes:1", provider="hermes", prompt_tokens=20, host="ignored")]
+
+    assert database.ingest_events("laptop", remote) == 1
+    assert database.stats()["requests"] == 2  # same source_id on another host does not collide
+    assert database.stats(host="laptop")["total_tokens"] == 20
+    assert database.ingest_events("laptop", remote) == 0  # unchanged resend is a no-op
+    grown = [UsageEvent(source_id="hermes:1", provider="hermes", prompt_tokens=50)]
+    assert database.ingest_events("laptop", grown) == 1
+    assert database.stats(host="laptop")["total_tokens"] == 50
+    assert database.ingest_events("", grown) == 0
+    assert all(row["host"] == "laptop" for row in database.recent() if row["source_id"].startswith("laptop::"))
+
+
+def test_pending_forward_tracks_local_unsynced_rows(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", hostname="laptop")
+    database.insert_events([UsageEvent(source_id="a", provider="claude", prompt_tokens=1, host="laptop")])
+    database.ingest_events("other", [UsageEvent(source_id="x", provider="claude", prompt_tokens=1)])
+
+    pending = database.pending_forward()
+    assert [event.source_id for _, event in pending] == ["a"]  # ingested rows are never forwarded on
+    assert database.pending_forward_count() == 1
+    database.mark_forwarded(row_id for row_id, _ in pending)
+    assert database.pending_forward() == []
+
+    # An upsert that changes the row queues it again.
+    database.upsert_events([UsageEvent(source_id="a", provider="claude", prompt_tokens=9, host="laptop")])
+    assert database.pending_forward_count() == 1
+    database.set_meta("k", {"n": 1})
+    assert database.get_meta("k") == {"n": 1} and database.get_meta("missing") is None

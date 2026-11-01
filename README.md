@@ -69,6 +69,8 @@ tracker pricing
 tracker reprice
 tracker install-service
 tracker uninstall-service
+tracker ingest-token          # main tracker: allow other machines to push events
+tracker link <url> --token …  # second machine: push events to the main tracker
 ```
 
 Data is stored at `~/.tokentracker/usage.db`. The default Claude log directory is `~/.claude/projects`; override it with `TOKEN_TRACKER_CLAUDE_DIR`.
@@ -146,8 +148,11 @@ Install and start a per-user service that runs the collector in the background:
 tracker install-service
 ```
 
-- **Linux (systemd):** writes `~/.config/systemd/user/tokentracker.service` (respecting `XDG_CONFIG_HOME`), reloads the user manager, enables the unit, and restarts it.
-- **macOS (launchd):** writes `~/Library/LaunchAgents/com.tokentracker.collector.plist` and loads it with `launchctl bootstrap`. The agent starts at login and restarts if it exits. Its log is `~/.tokentracker/collector.log`.
+Two services are installed: the collector and the dashboard API (`tokentracker-dashboard.service` /
+`com.tokentracker.dashboard`), so the dashboard and the ingest endpoint are always up.
+
+- **Linux (systemd):** writes the units to `~/.config/systemd/user/` (respecting `XDG_CONFIG_HOME`), reloads the user manager, enables them, and restarts them.
+- **macOS (launchd):** writes the plists to `~/Library/LaunchAgents/` and loads them with `launchctl bootstrap`. The agents start at login and restart if they exit. Logs are `~/.tokentracker/collector.log` and `dashboard.log`.
 - **Windows:** not supported. The command prints the exact `python -m tokentracker.collector.service` line to schedule at logon with Task Scheduler.
 
 The service runs `python -m tokentracker.collector.service`, which polls every `TOKEN_TRACKER_POLL_SECONDS` (default 2 s). Each poll re-parses only the files whose size or modification time changed, so an idle poll costs a directory walk and nothing else. On the first poll after a start it reads every transcript once.
@@ -170,14 +175,56 @@ The dashboard API is started on demand by `tracker dashboard`.
 
 ## Second machine
 
-To track another machine (for example a work laptop), repeat the install there. The data stays local to each machine; nothing is uploaded.
+Every event carries the name of the machine it came from, and the dashboard gets a machine selector when
+more than one is present. A second machine (for example a work laptop) runs the same collector and pushes
+its events to the main tracker over HTTPS. Only token counts, model names, timestamps, and a salted hash of
+each project name leave the machine; paths and titles never do. The laptop keeps its own copy and catches up
+after being offline.
+
+### On the main tracker
+
+1. Install and start the services (the dashboard now runs as a service too, so it is always on):
+
+   ```bash
+   tracker install-service
+   tracker ingest-token
+   ```
+
+   `ingest-token` writes a bearer token to `~/.tokentracker/ingest_token` (mode 600) and enables
+   `POST /api/events`. Without that file the endpoint returns 404.
+
+2. Make the endpoint reachable from the laptop. The dashboard binds to 127.0.0.1, so nothing is exposed
+   until you choose how. With Tailscale on your personal tailnet, Funnel publishes one path on a public
+   HTTPS address while the rest of the dashboard stays tailnet-only:
+
+   ```bash
+   # once, in the Tailscale admin console: enable HTTPS certificates and add the
+   # "funnel" node attribute for this machine (Access controls -> nodeAttrs).
+   sudo tailscale funnel --bg --set-path /api/events http://127.0.0.1:8765/api/events
+   sudo tailscale serve  --bg --https=8443 http://127.0.0.1:8765
+   tailscale funnel status
+   ```
+
+   The first line publishes only `/api/events` at `https://<machine>.<tailnet>.ts.net`. The second serves
+   the whole dashboard at `https://<machine>.<tailnet>.ts.net:8443` to devices on your tailnet only.
+   Funnel works even when the laptop is on a different tailnet, because the laptop only makes an outbound
+   HTTPS request.
+
+### On the second machine
 
 ```bash
 git clone <this repo> ~/Projects/token-tracker
 cd ~/Projects/token-tracker
 uv tool install .
+tracker link https://<machine>.<tailnet>.ts.net --token <token from ingest-token> --host-label work-laptop
 tracker install-service
 tracker status
 ```
 
-Claude Code writes its transcripts to `~/.claude/projects` on Linux and macOS, so no configuration is needed for Claude Code. If Claude Code uses a different config directory (`CLAUDE_CONFIG_DIR`), set `TOKEN_TRACKER_CLAUDE_DIR` to `<that dir>/projects` in the service environment.
+`link` saves the remote URL, the token, and a random salt for project hashing in `~/.tokentracker/config.json`
+(mode 600). Pass `--project-labels clear` to send real project names. `tracker status` shows the pending
+count and the last successful push; `tracker unlink` stops forwarding.
+
+Claude Code writes its transcripts to `~/.claude/projects` on Linux and macOS, so no configuration is needed
+for Claude Code. If Claude Code uses a different config directory (`CLAUDE_CONFIG_DIR`), set
+`TOKEN_TRACKER_CLAUDE_DIR` to `<that dir>/projects` in the service environment.
