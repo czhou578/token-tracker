@@ -24,9 +24,9 @@ __all__ = ["router"]
 router = APIRouter()
 
 
-def get_database() -> UsageDatabase:
-    settings = get_settings()
-    return UsageDatabase(settings.db_path, hostname=settings.hostname)
+def get_database(request: Request) -> UsageDatabase:
+    """The app's shared database handle, opened once by `create_app`."""
+    return request.app.state.database
 
 
 def _filters(
@@ -147,13 +147,13 @@ async def ingest(request: Request) -> dict[str, int]:
         batch = IngestBatch.model_validate_json(body)
     except ValidationError as error:
         raise HTTPException(status_code=422, detail=error.errors(include_url=False, include_input=False)) from None
-    database = get_database()
+    database = get_database(request)
     accepted = await run_in_threadpool(database.ingest_events, batch.host, batch.events)
     return {"accepted": accepted, "received": len(batch.events)}
 
 
 @router.get("/pricing")
-def pricing() -> dict:
+def pricing(database: UsageDatabase = Depends(get_database)) -> dict:
     """The rate table behind `cost_usd`, for the dashboard's cost explainer."""
     values = get_settings()
     table = Pricing.load(values.pricing_file)
@@ -167,13 +167,12 @@ def pricing() -> dict:
         "us_inference_multiplier": US_INFERENCE_MULTIPLIER,
         "web_search_usd_per_request": WEB_SEARCH_USD_PER_REQUEST,
         "rates": {model: table.table[model] for model in sorted(table.table)},
-        "unpriced_models": get_database().unpriced_models(),
+        "unpriced_models": database.unpriced_models(),
     }
 
 
 @router.get("/settings")
-def settings() -> dict:
-    database = get_database()
+def settings(database: UsageDatabase = Depends(get_database)) -> dict:
     values = get_settings()
     return database.settings() | {
         "claude_dir": str(values.claude_dir),

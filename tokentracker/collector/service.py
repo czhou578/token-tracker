@@ -14,6 +14,7 @@ from tokentracker.collector.parser import (
     parse_hermes_state_db,
 )
 from tokentracker.collector.forwarder import Forwarder
+from tokentracker.collector.memory import release_memory
 from tokentracker.collector.pricing import Pricing
 
 log = logging.getLogger("tokentracker.collector")
@@ -61,6 +62,8 @@ class Collector:
         self._claude_files: dict[Path, Signature] = {}
         self._sources: dict[Path, Signature] = {}
         self._pricing_signature = file_signature(self.pricing_file) if self.pricing_file else None
+        # Set when this poll parsed a source or repriced, so the freed memory is released.
+        self._parsed = False
 
     def scan_once(self) -> int:
         self._refresh_pricing()
@@ -75,6 +78,9 @@ class Collector:
             # is open, so refresh existing rows instead of ignoring them.
             inserted += self.database.upsert_events(prepare(parse_hermes_state_db(self.hermes_db)))
         self.forwarder.flush()
+        if self._parsed:
+            self._parsed = False
+            release_memory()
         return inserted
 
     def _prepare(self, events):
@@ -101,6 +107,7 @@ class Collector:
         self.pricing = Pricing.load(self.pricing_file)
         log.info("pricing overrides %s: %s", "loaded from" if signature else "removed,", self.pricing_file)
         self.reprice()
+        self._parsed = True
 
     def _scan_claude(self) -> int:
         if not self.root.exists():
@@ -115,8 +122,7 @@ class Collector:
             del self._claude_files[stale]
         return inserted
 
-    @staticmethod
-    def _changed(registry: dict[Path, Signature], path: Path | None) -> bool:
+    def _changed(self, registry: dict[Path, Signature], path: Path | None) -> bool:
         """Record the current signature of *path* and report whether it changed."""
         if path is None:
             return False
@@ -127,6 +133,7 @@ class Collector:
         if registry.get(path) == signature:
             return False
         registry[path] = signature
+        self._parsed = True
         return True
 
     def run_forever(self) -> None:

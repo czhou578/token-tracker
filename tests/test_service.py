@@ -72,6 +72,26 @@ def test_collector_reparses_only_changed_transcripts(isolated, monkeypatch):
     assert transcript not in collector._claude_files
 
 
+def test_collector_releases_memory_only_after_a_parse(isolated, monkeypatch):
+    transcript = isolated / "claude" / "proj" / "a.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_text(_claude_line("m1", 10))
+    releases: list[int] = []
+    monkeypatch.setattr(service, "release_memory", lambda: releases.append(1))
+    collector = Collector()
+
+    collector.scan_once()
+    assert len(releases) == 1
+    collector.scan_once()
+    assert len(releases) == 1
+
+    with transcript.open("a") as handle:
+        handle.write(_claude_line("m2", 20))
+    _bump_mtime(transcript)
+    collector.scan_once()
+    assert len(releases) == 2
+
+
 def _hermes_db(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute(

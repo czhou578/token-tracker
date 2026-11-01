@@ -82,3 +82,18 @@ def test_dashboard_files_are_revalidated(client) -> None:
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-cache"
     assert "cache-control" not in http.get("/api/health").headers
+
+
+def test_requests_share_one_database_and_release_memory(client, monkeypatch) -> None:
+    import tokentracker.api.main as main
+    from tokentracker.collector.database import UsageDatabase
+
+    http, _ = client
+    inits: list[UsageDatabase] = []
+    releases: list[int] = []
+    monkeypatch.setattr(UsageDatabase, "init", lambda self: inits.append(self))
+    monkeypatch.setattr(main, "release_memory", lambda: releases.append(1))
+    for path in ("/api/stats", "/api/pricing", "/api/settings", "/api/hosts"):
+        assert http.get(path).status_code == 200
+    assert inits == []
+    assert len(releases) == 4
