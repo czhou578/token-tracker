@@ -5,6 +5,7 @@ const ids = {
   requests: document.querySelector("#requests"),
   threads: document.querySelector("#threads"),
   dailyChart: document.querySelector("#dailyChart"),
+  seriesTitle: document.querySelector("#seriesTitle"),
   dailyRange: document.querySelector("#dailyRange"),
   modelsChart: document.querySelector("#modelsChart"),
   projectsChart: document.querySelector("#projectsChart"),
@@ -47,14 +48,14 @@ async function get(path) {
 }
 
 async function load() {
-  const [stats, daily, models, projects] = await Promise.all([
+  const [stats, series, models, projects] = await Promise.all([
     get("stats"),
-    get("daily"),
+    get("series"),
     get("models"),
     get("projects"),
   ]);
   renderStats(stats);
-  renderDaily(daily);
+  renderSeries(series);
   renderBars(ids.modelsChart, models, "model");
   renderBars(ids.projectsChart, projects, "project");
 }
@@ -74,7 +75,28 @@ function renderStats(stats) {
   ids.threads.textContent = count(stats.threads);
 }
 
-function renderDaily(rows) {
+const UNIT_LABEL = { hour: "Hour", day: "Day", week: "Week", month: "Month" };
+const MAX_AXIS_LABELS = 12;
+
+function periodLabel(period, unit) {
+  const text = String(period);
+  if (unit === "hour") return text.slice(11, 16);
+  if (unit === "month") return text.slice(0, 7);
+  return text.slice(5, 10);
+}
+
+function periodTitle(period, unit) {
+  const text = String(period);
+  if (unit === "hour") return `${text.slice(0, 10)} ${text.slice(11, 16)} UTC`;
+  if (unit === "week") return `week of ${text.slice(0, 10)}`;
+  if (unit === "month") return text.slice(0, 7);
+  return text.slice(0, 10);
+}
+
+function renderSeries(series) {
+  const unit = series.unit || "day";
+  const rows = series.rows || [];
+  ids.seriesTitle.textContent = `Tokens / ${UNIT_LABEL[unit] || "Day"}`;
   ids.dailyChart.innerHTML = "";
   if (!rows.length) {
     ids.dailyChart.innerHTML = '<div class="empty">No usage events found yet</div>';
@@ -82,13 +104,18 @@ function renderDaily(rows) {
     return;
   }
   const max = Math.max(...rows.map((row) => row.total_tokens || 0), 1);
-  ids.dailyRange.textContent = `${rows.length} day${rows.length === 1 ? "" : "s"}`;
-  rows.sort((a, b) => String(a.day).localeCompare(String(b.day))).forEach((row) => {
+  const unitName = (UNIT_LABEL[unit] || "Day").toLowerCase();
+  ids.dailyRange.textContent = `${rows.length} ${unitName}${rows.length === 1 ? "" : "s"}`;
+  // Label at most MAX_AXIS_LABELS bars so labels never collide, whatever the bar count.
+  const step = Math.max(1, Math.ceil(rows.length / MAX_AXIS_LABELS));
+  rows.forEach((row, index) => {
     const bar = document.createElement("div");
     bar.className = "bar";
-    bar.style.height = `${Math.max(3, ((row.total_tokens || 0) / max) * 100)}%`;
-    bar.title = `${row.day}: ${fmt.format(row.total_tokens || 0)} tokens, ${money(row.cost_usd)}`;
-    bar.innerHTML = `<span>${String(row.day).slice(5)}</span>`;
+    bar.style.height = `${Math.max(2, ((row.total_tokens || 0) / max) * 100)}%`;
+    bar.title = `${periodTitle(row.period, unit)}: ${fmt.format(row.total_tokens || 0)} tokens, ${money(row.cost_usd)}, ${fmt.format(row.requests || 0)} requests`;
+    if (index % step === 0) {
+      bar.innerHTML = `<span>${periodLabel(row.period, unit)}</span>`;
+    }
     ids.dailyChart.appendChild(bar);
   });
 }

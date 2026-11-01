@@ -224,3 +224,27 @@ def test_fresh_database_marks_migration_done_without_backup(tmp_path) -> None:
     info = database.migration_info()
     assert info["removed"] == 0 and info["backup"] is None
     assert list(tmp_path.glob("*.bak-*")) == []
+
+
+def test_series_buckets_follow_the_window(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db")
+    database.insert_events(
+        [
+            UsageEvent(source_id="a", provider="claude", prompt_tokens=10, timestamp=datetime(2026, 10, 5, 9, tzinfo=timezone.utc)),   # Monday
+            UsageEvent(source_id="b", provider="claude", prompt_tokens=20, timestamp=datetime(2026, 10, 11, 23, tzinfo=timezone.utc)),  # Sunday, same week
+            UsageEvent(source_id="c", provider="claude", prompt_tokens=40, timestamp=datetime(2026, 10, 12, 1, tzinfo=timezone.utc)),   # next Monday
+            UsageEvent(source_id="d", provider="claude", prompt_tokens=80, timestamp=datetime(2026, 11, 1, 1, tzinfo=timezone.utc)),
+        ]
+    )
+
+    by_week = database.series(window=None)
+    assert by_week["unit"] == "month"
+    assert [(row["period"], row["total_tokens"]) for row in by_week["rows"]] == [("2026-10-01", 70), ("2026-11-01", 80)]
+
+    from tokentracker.collector.database import BUCKET_EXPRESSIONS, bucket_unit
+
+    assert bucket_unit("90d") == "week" and bucket_unit("7d") == "day" and bucket_unit("today") == "hour"
+    weeks = database._grouped(BUCKET_EXPRESSIONS["week"], "period", {})
+    assert sorted((row["period"], row["total_tokens"]) for row in weeks) == [("2026-10-05", 30), ("2026-10-12", 40), ("2026-10-26", 80)]
+    days = database._grouped(BUCKET_EXPRESSIONS["day"], "period", {})
+    assert len(days) == 4

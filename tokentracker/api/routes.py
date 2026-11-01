@@ -43,6 +43,7 @@ def _filters(
 _ROUTE_METHODS = {
     "stats",
     "daily",
+    "series",
     "models",
     "projects",
     "threads",

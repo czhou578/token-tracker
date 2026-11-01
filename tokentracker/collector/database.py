@@ -222,6 +222,17 @@ class UsageDatabase:
     def daily(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("date(timestamp)", "day", filters)
 
+    def series(self, **filters: Any) -> dict[str, Any]:
+        """Token totals over time, bucketed to suit the window.
+
+        Short windows get hours or days; 90 days gets weeks; all time gets
+        months. That keeps the chart to a few dozen bars at most.
+        """
+        unit = bucket_unit(filters.get("window"))
+        rows = self._grouped(BUCKET_EXPRESSIONS[unit], "period", filters)
+        rows.sort(key=lambda row: str(row["period"]))
+        return {"unit": unit, "rows": rows}
+
     def models(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("COALESCE(model, 'unknown')", "model", filters)
 
@@ -418,6 +429,28 @@ def _dict(row: sqlite3.Row) -> dict[str, Any]:
 
 def _dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [_dict(row) for row in rows]
+
+
+# Bucket start as an ISO string. Weeks start on Monday: 'weekday 0' moves to
+# the next Sunday, then six days back.
+BUCKET_EXPRESSIONS = {
+    "hour": "strftime('%Y-%m-%dT%H:00', timestamp)",
+    "day": "date(timestamp)",
+    "week": "date(timestamp, 'weekday 0', '-6 days')",
+    "month": "strftime('%Y-%m-01', timestamp)",
+}
+
+
+def bucket_unit(window: str | None) -> str:
+    match window:
+        case "today" | "yesterday":
+            return "hour"
+        case "7d" | "week" | "30d" | "month":
+            return "day"
+        case "90d":
+            return "week"
+        case _:
+            return "month"
 
 
 def _window_bounds(window: str | None) -> tuple[datetime | None, datetime | None]:
