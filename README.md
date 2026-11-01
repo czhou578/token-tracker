@@ -10,19 +10,40 @@ Token Tracker watches Claude Code JSONL session logs, Cline's SQLite message dat
 
 ## Install
 
-### Development (recommended)
+### For daily use (recommended)
+
+Install the package as a standalone tool. This gives you a `tracker` command on your `PATH` and a
+private environment under `~/.local/share/uv/tools/`. That environment is independent of the project
+folder, so the background service keeps running when you delete or recreate the project's `.venv`.
 
 ```bash
-uv venv
-uv sync
-source .venv/bin/activate
+git clone <this repo> ~/Projects/token-tracker
+cd ~/Projects/token-tracker
+uv tool install .
+tracker install-service
+tracker status
 ```
 
-### Production
+`pipx install .` works the same way if you do not use `uv`.
+
+After you change the code, refresh the tool environment and restart the service:
 
 ```bash
-pip install -e .
+uv tool install --reinstall .
+tracker install-service
 ```
+
+### Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run tracker
+```
+
+`uv sync` creates `.venv` inside the project. Do not run `tracker install-service` from this
+environment: the service would point at `.venv`, and the next `rm -rf .venv` would stop it. The
+command prints a warning when it detects this.
 
 ## Use
 
@@ -42,15 +63,27 @@ python -m tokentracker dashboard
 Useful commands:
 
 ```bash
-tracker today
-tracker week
-tracker projects
-tracker models
-tracker collect --once
+tracker dashboard
+tracker status
+tracker pricing
+tracker reprice
 tracker install-service
+tracker uninstall-service
 ```
 
 Data is stored at `~/.tokentracker/usage.db`. The default Claude log directory is `~/.claude/projects`; override it with `TOKEN_TRACKER_CLAUDE_DIR`.
+
+### How Claude Code transcripts are counted
+
+Claude Code writes one transcript line per content block of a response (thinking, text, each tool call), and
+every line repeats the response's `usage` object. Token Tracker counts each API response once: it keeps the
+first line of each `message.id`. A request in the dashboard is one API call.
+
+Databases written before this rule held one row per line, which inflated Claude token counts about 2.8x.
+The first start after the upgrade writes a copy of the database next to it (`usage.db.bak-<timestamp>`) and
+collapses those rows. Transcripts that still exist are re-parsed, so the result is exact. For transcripts
+Claude Code has already deleted, consecutive rows with identical model and token counts within 30 minutes
+are treated as one response. `tracker status` shows what the migration did.
 
 ## Cline
 
@@ -62,22 +95,89 @@ Both Claude Code and Cline usage is aggregated together and labelled by the `pro
 
 ## Hermes
 
-Hermes stores each conversation and its aggregate token usage in a SQLite state database at `~/.hermes/state.db`. Token Tracker reads the `sessions` table and ingests finished conversations (those with an `ended_at` timestamp); in-progress sessions are picked up once they close. To point at a specific file, set `TOKEN_TRACKER_HERMES_DB` to the path of the state database.
+Hermes stores each conversation and its aggregate token usage in a SQLite state database at `~/.hermes/state.db`. Token Tracker reads the `sessions` table and ingests every conversation, open or closed. An open session's counts grow while you chat, so the collector refreshes that row on each poll instead of waiting for `ended_at`. Hermes closes a session about a day after it starts, so this keeps the dashboard current. To point at a specific file, set `TOKEN_TRACKER_HERMES_DB` to the path of the state database.
+
+Hermes records whatever model its `config.yaml` names, including a local model behind a vLLM server (for example `deepseek-v4-flash-0731` on `http://127.0.0.1:8888/v1`). The token counts come from the server's `usage` field in each response, so they are the server's own counts.
 
 Hermes usage is labelled with `provider = "hermes"` and aggregated alongside Claude Code and Cline.
 
+## Cost Estimates
+
+Every event carries `cost_usd`, an estimate at Anthropic's published list prices. The dashboard shows the
+total and how many requests it covers. The `?` button on the cost card opens an explanation of the formula
+with the rate table in use. `tracker pricing` prints the same table and `tracker reprice` recomputes every
+stored event.
+
+**What is exact.** For Claude models the token counts come from the API's own `usage` object, which is
+what Anthropic bills. The estimate applies the rules on the
+[pricing page](https://platform.claude.com/docs/en/about-claude/pricing): per-model input and output
+rates, 1.25x input for 5-minute cache writes, 2x for 1-hour writes, the per-model cache-read rate
+(0.1x input, 0.025x on Fable 5.1, 0.05x on Opus 5.5 and Sonnet 5.5), fast-mode rates, the Haiku 5.5
+over-100K prompt tier, the 1.1x US-only inference multiplier, and $0.01 per web search. Claude Code
+transcripts carry all of these fields, so the estimate matches Claude Code's own `/usage` figure.
+
+**What is not.** The figure is a list-price equivalent. On a Pro or Max subscription nothing is billed per
+token, and API customers with negotiated rates or Batch discounts pay less. The bundled rate table is a
+snapshot (`tracker pricing` prints its date); when Anthropic changes prices, update the table and run
+`tracker reprice`. Cline and Hermes report only one cache-write total, so their cache writes are priced at
+the 5-minute rate.
+
+**Local models have no price.** Events from a model that is not in the table get `cost_usd = NULL` and
+count as unpriced. To see what the same tokens would cost at a hosted provider, add a rate card to
+`~/.tokentracker/pricing.json` (or the file named by `TOKEN_TRACKER_PRICING`). The collector reloads it
+and reprices history when it changes. Keys are matched as a prefix of the model id. Set a key to `null`
+to remove a bundled entry.
+
+```json
+{
+  "deepseek-v4-flash": {"input": 0.14, "output": 0.28, "cache_read": 0.0028},
+  "qwen3.8-27b": {"input": 0.0, "output": 0.0}
+}
+```
+
+Rates are USD per million tokens. `cache_write_5m` and `cache_write_1h` default to 1.25x and 2x `input`.
+When Cline or Hermes report a cost themselves, that figure is used instead of the table.
+
 ## Background Collection
 
-On Linux with systemd, install and start a per-user service that runs the collector in the background:
+Install and start a per-user service that runs the collector in the background:
 
 ```bash
 tracker install-service
 ```
 
-This writes `~/.config/systemd/user/tokentracker.service` (respecting `XDG_CONFIG_HOME`), runs `systemctl --user daemon-reload`, and enables/starts the unit. The unit execs `python -m tokentracker.collector.service`, which loops over `scan_once()` every `TOKEN_TRACKER_POLL_SECONDS` (default 2 s). Stop and remove it with:
+- **Linux (systemd):** writes `~/.config/systemd/user/tokentracker.service` (respecting `XDG_CONFIG_HOME`), reloads the user manager, enables the unit, and restarts it.
+- **macOS (launchd):** writes `~/Library/LaunchAgents/com.tokentracker.collector.plist` and loads it with `launchctl bootstrap`. The agent starts at login and restarts if it exits. Its log is `~/.tokentracker/collector.log`.
+- **Windows:** not supported. The command prints the exact `python -m tokentracker.collector.service` line to schedule at logon with Task Scheduler.
+
+The service runs `python -m tokentracker.collector.service`, which polls every `TOKEN_TRACKER_POLL_SECONDS` (default 2 s). Each poll re-parses only the files whose size or modification time changed, so an idle poll costs a directory walk and nothing else. On the first poll after a start it reads every transcript once.
+
+The unit records the absolute path of the Python interpreter that ran `tracker install-service`. If that interpreter disappears, the service fails on every start. Check it with:
+
+```bash
+tracker status
+```
+
+This prints the service state and restart count, the interpreter path and whether it exists, and the newest event per source (`claude`, `cline`, `hermes`). A `MISSING` interpreter means: reinstall the package (`uv tool install --reinstall .`) and run `tracker install-service` again.
+
+Stop and remove the service with:
 
 ```bash
 tracker uninstall-service
 ```
 
 The dashboard API is started on demand by `tracker dashboard`.
+
+## Second machine
+
+To track another machine (for example a work laptop), repeat the install there. The data stays local to each machine; nothing is uploaded.
+
+```bash
+git clone <this repo> ~/Projects/token-tracker
+cd ~/Projects/token-tracker
+uv tool install .
+tracker install-service
+tracker status
+```
+
+Claude Code writes its transcripts to `~/.claude/projects` on Linux and macOS, so no configuration is needed for Claude Code. If Claude Code uses a different config directory (`CLAUDE_CONFIG_DIR`), set `TOKEN_TRACKER_CLAUDE_DIR` to `<that dir>/projects` in the service environment.

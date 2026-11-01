@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tokentracker.collector.models import UsageEvent
+
+if TYPE_CHECKING:
+    from tokentracker.collector.pricing import Pricing
 
 
 SCHEMA = """
@@ -26,6 +31,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER,
+    cost_usd REAL,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -33,7 +39,20 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp)
 CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events(project);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_thread ON usage_events(thread_id);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+# One-time migration marker: Claude rows ingested before parse_claude_jsonl
+# deduplicated responses hold one row per content block of each response.
+CLAUDE_DEDUPE_MARKER = "claude_response_dedupe_v1"
+# Lines of one response are usually written within milliseconds, but a long
+# generation can spread them over several minutes (472 s observed). This is the
+# widest gap still treated as the same response when the transcript is gone.
+CLAUDE_DEDUPE_WINDOW_SECONDS = 1800
 
 INSERT_COLUMNS = (
     "source_id",
@@ -50,6 +69,7 @@ INSERT_COLUMNS = (
     "reasoning_tokens",
     "total_tokens",
     "latency_ms",
+    "cost_usd",
     "metadata_json",
 )
 
@@ -68,18 +88,112 @@ class UsageDatabase:
     def init(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(usage_events)")}
+            if "cost_usd" not in columns:
+                # Databases created before cost estimates existed.
+                connection.execute("ALTER TABLE usage_events ADD COLUMN cost_usd REAL")
+        self._migrate_claude_duplicates()
+
+    def _migrate_claude_duplicates(self) -> None:
+        """Collapse legacy per-content-block Claude rows into one row per response, once.
+
+        A copy of the database is written next to it first. Transcripts that
+        still exist are re-parsed, so exactly the rows the current parser would
+        produce survive. Claude Code deletes transcripts after 30 days, so rows
+        from missing files are deduplicated in place by a heuristic: within one
+        transcript, consecutive rows with identical model and token counts
+        written within `CLAUDE_DEDUPE_WINDOW_SECONDS` are one response.
+        """
+        with self.connect() as connection:
+            if connection.execute("SELECT 1 FROM meta WHERE key = ?", (CLAUDE_DEDUPE_MARKER,)).fetchone():
+                return
+            has_rows = connection.execute("SELECT 1 FROM usage_events WHERE provider = 'claude' LIMIT 1").fetchone()
+        result: dict[str, Any] = {"removed": 0, "backup": None, "at": datetime.now(timezone.utc).isoformat()}
+        if has_rows:
+            backup = self.path.with_name(f"{self.path.name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
+            with self.connect() as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            result["backup"] = str(backup)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM meta WHERE key = ?", (CLAUDE_DEDUPE_MARKER,)).fetchone():
+                return  # another process finished first
+            if has_rows:
+                result["removed"] = dedupe_claude_rows(connection)
+            connection.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (CLAUDE_DEDUPE_MARKER, json.dumps(result))
+            )
+
+    def migration_info(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT value FROM meta WHERE key = ?", (CLAUDE_DEDUPE_MARKER,)).fetchone()
+        return json.loads(row["value"]) if row else None
 
     def insert_events(self, events: Iterable[UsageEvent]) -> int:
+        """Insert new events; rows whose ``source_id`` already exists are left alone."""
+        return self._write(_INSERT_SQL, events)
+
+    def upsert_events(self, events: Iterable[UsageEvent]) -> int:
+        """Insert new events and refresh existing rows whose counts changed.
+
+        Use this for sources that report one growing aggregate per
+        conversation, such as Hermes sessions.
+        """
+        return self._write(_UPSERT_SQL, events)
+
+    def _write(self, sql: str, events: Iterable[UsageEvent]) -> int:
         rows = [_event_row(event) for event in events]
         if not rows:
             return 0
         with self.connect() as connection:
             before = connection.total_changes
-            connection.executemany(
-                _INSERT_SQL,
-                rows,
-            )
+            connection.executemany(sql, rows)
             return connection.total_changes - before
+
+    def reprice(self, pricing: "Pricing") -> int:
+        """Recompute `cost_usd` for every stored event. Returns the number of rows changed."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id, {', '.join(INSERT_COLUMNS)} FROM usage_events"
+            ).fetchall()
+            updates = []
+            for row in rows:
+                event = _event_from_row(row)
+                priced = pricing.price_event(event)
+                if priced.cost_usd != event.cost_usd or priced.metadata_json != event.metadata_json:
+                    updates.append((priced.cost_usd, priced.metadata_json, row["id"]))
+            if updates:
+                connection.executemany(
+                    "UPDATE usage_events SET cost_usd = ?, metadata_json = ? WHERE id = ?", updates
+                )
+            return len(updates)
+
+    def unpriced_models(self) -> list[dict[str, Any]]:
+        """Models with events that have no cost estimate, largest token volume first."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS events,
+                       SUM(total_tokens) AS total_tokens, MAX(timestamp) AS last_timestamp
+                FROM usage_events
+                WHERE cost_usd IS NULL
+                GROUP BY model
+                ORDER BY total_tokens DESC
+                """
+            ).fetchall()
+        return _dicts(rows)
+
+    def latest_by_provider(self) -> dict[str, dict[str, Any]]:
+        """Return event count and newest timestamp per provider."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT provider, COUNT(*) AS events, MAX(timestamp) AS last_timestamp
+                FROM usage_events
+                GROUP BY provider
+                """
+            ).fetchall()
+        return {row["provider"]: _dict(row) for row in rows}
 
     def stats(self, **filters: Any) -> dict[str, Any]:
         where, values = self._filters(filters)
@@ -93,6 +207,8 @@ class UsageDatabase:
                     COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                     COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                     COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                    COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                    COUNT(cost_usd) AS priced_requests,
                     COUNT(*) AS requests,
                     COUNT(DISTINCT thread_id) AS threads,
                     COUNT(DISTINCT project) AS projects,
@@ -101,9 +217,7 @@ class UsageDatabase:
                 """,
                 values,
             ).fetchone()
-        result = _dict(row)
-        result["api_equivalent_tokens"] = result["total_tokens"]
-        return result
+        return _dict(row)
 
     def daily(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("date(timestamp)", "day", filters)
@@ -126,6 +240,7 @@ class UsageDatabase:
                     COALESCE(project, 'unknown') AS project,
                     COALESCE(model, 'unknown') AS model,
                     SUM(total_tokens) AS total_tokens,
+                    SUM(cost_usd) AS cost_usd,
                     COUNT(*) AS messages
                 FROM usage_events {where}
                 GROUP BY thread
@@ -144,7 +259,7 @@ class UsageDatabase:
         with self.connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT timestamp, project, provider, model, total_tokens, thread_id
+                SELECT source_id, timestamp, project, provider, model, total_tokens, cost_usd, thread_id
                 FROM usage_events {where}
                 ORDER BY timestamp DESC
                 LIMIT ?
@@ -166,6 +281,8 @@ class UsageDatabase:
                     SUM(total_tokens) AS total_tokens,
                     SUM(prompt_tokens) AS prompt_tokens,
                     SUM(completion_tokens) AS completion_tokens,
+                    SUM(cost_usd) AS cost_usd,
+                    COUNT(cost_usd) AS priced_requests,
                     COUNT(*) AS requests,
                     COUNT(DISTINCT thread_id) AS threads,
                     AVG(latency_ms) AS average_latency_ms
@@ -203,12 +320,96 @@ INSERT OR IGNORE INTO usage_events ({", ".join(INSERT_COLUMNS)})
 VALUES ({", ".join("?" for _ in INSERT_COLUMNS)})
 """
 
+_UPDATE_COLUMNS = tuple(column for column in INSERT_COLUMNS if column != "source_id")
+
+# Only rewrite a row when its counts or metadata moved, so `total_changes`
+# reports real updates and unchanged rows cost nothing.
+_UPSERT_SQL = f"""
+INSERT INTO usage_events ({", ".join(INSERT_COLUMNS)})
+VALUES ({", ".join("?" for _ in INSERT_COLUMNS)})
+ON CONFLICT(source_id) DO UPDATE SET
+    {", ".join(f"{column} = excluded.{column}" for column in _UPDATE_COLUMNS)}
+WHERE excluded.total_tokens != usage_events.total_tokens
+   OR excluded.metadata_json != usage_events.metadata_json
+   OR excluded.cost_usd IS NOT usage_events.cost_usd
+"""
+
 
 def _event_row(event: UsageEvent) -> tuple[Any, ...]:
     event = event.normalized()
     values = event.model_dump()
     values["timestamp"] = event.timestamp.astimezone(timezone.utc).isoformat()
     return tuple(values[column] for column in INSERT_COLUMNS)
+
+
+def dedupe_claude_rows(connection: sqlite3.Connection) -> int:
+    """Delete legacy duplicate Claude rows; return how many were removed.
+
+    Rows whose transcript still exists are matched against a fresh parse of
+    that transcript (exact). Rows whose transcript is gone are collapsed by
+    `_heuristic_duplicates`. Also sets `thread_id` to the session id, which
+    older rows filled with the per-line `uuid`.
+    """
+    from tokentracker.collector.parser import parse_claude_jsonl  # local import: parser is a leaf module
+
+    rows = connection.execute(
+        """
+        SELECT id, source_id, timestamp, model, prompt_tokens, completion_tokens,
+               cache_read_tokens, cache_write_tokens
+        FROM usage_events WHERE provider = 'claude'
+        """
+    ).fetchall()
+    by_file: dict[str, list[tuple[int, sqlite3.Row]]] = defaultdict(list)
+    for row in rows:
+        file, _, line = row["source_id"].rpartition(":")
+        if line.isdigit():
+            by_file[file].append((int(line), row))
+
+    to_delete: list[tuple[int]] = []
+    for file, items in by_file.items():
+        path = Path(file)
+        if path.is_file():
+            keep = {event.source_id for event in parse_claude_jsonl(path, path.parent)}
+            to_delete.extend((row["id"],) for _, row in items if row["source_id"] not in keep)
+        else:
+            to_delete.extend(_heuristic_duplicates(items))
+    if to_delete:
+        connection.executemany("DELETE FROM usage_events WHERE id = ?", to_delete)
+    connection.execute(
+        """
+        UPDATE usage_events SET thread_id = conversation_id
+        WHERE provider = 'claude' AND conversation_id IS NOT NULL AND thread_id IS NOT conversation_id
+        """
+    )
+    return len(to_delete)
+
+
+def _heuristic_duplicates(items: list[tuple[int, sqlite3.Row]]) -> list[tuple[int]]:
+    """Ids of rows that repeat the previous kept row's model and counts within the window."""
+    duplicates: list[tuple[int]] = []
+    kept_signature: tuple | None = None
+    kept_time: datetime | None = None
+    for _, row in sorted(items, key=lambda item: item[0]):
+        signature = (
+            row["model"], row["prompt_tokens"], row["completion_tokens"],
+            row["cache_read_tokens"], row["cache_write_tokens"],
+        )
+        when = datetime.fromisoformat(row["timestamp"])
+        if (
+            kept_signature == signature
+            and kept_time is not None
+            and abs((when - kept_time).total_seconds()) <= CLAUDE_DEDUPE_WINDOW_SECONDS
+        ):
+            duplicates.append((row["id"],))
+            continue
+        kept_signature, kept_time = signature, when
+    return duplicates
+
+
+def _event_from_row(row: sqlite3.Row) -> UsageEvent:
+    values = {column: row[column] for column in INSERT_COLUMNS}
+    values["timestamp"] = datetime.fromisoformat(values["timestamp"])
+    return UsageEvent(**values)
 
 
 def _dict(row: sqlite3.Row) -> dict[str, Any]:

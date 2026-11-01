@@ -27,7 +27,12 @@
       </header>
 
       <section class="cards">
-        <article><span>API Equivalent</span><strong id="apiEquivalent">0</strong></article>
+        <article>
+          <span class="card-title">Est. cost (list price)
+            <button id="costHelp" class="help" type="button" aria-label="How is the cost calculated?" title="How is the cost calculated?">?</button>
+          </span>
+          <strong id="cost">$0.00</strong><small id="costNote"></small>
+        </article>
         <article><span>Total Tokens</span><strong id="totalTokens">0</strong></article>
         <article><span>Requests</span><strong id="requests">0</strong></article>
         <article><span>Threads</span><strong id="threads">0</strong></article>
@@ -51,6 +56,33 @@
         </article>
       </section>
     </main>
+
+    <dialog id="costDialog" class="dialog" aria-labelledby="costDialogTitle">
+      <div class="dialog-head">
+        <h2 id="costDialogTitle">How the cost is calculated</h2>
+        <button id="costClose" type="button">Close</button>
+      </div>
+      <div class="dialog-body">
+        <p>Every request is priced at Anthropic's published list prices, so the total is what the same tokens would cost on the Claude API. It is not a bill. A Pro or Max subscription has no per-token charge, and API customers with negotiated or Batch rates pay less.</p>
+        <p>For one request the formula is:</p>
+        <pre class="formula">input tokens × input rate
++ output tokens × output rate          (thinking tokens count as output)
++ cache-read tokens × cache-read rate
++ 5-minute cache writes × 1.25 × input rate
++ 1-hour cache writes × 2 × input rate</pre>
+        <p>Fast mode uses its own rates. Claude Haiku 5.5 uses higher rates when a prompt (input plus cache reads and writes) is over <span id="longPromptThreshold">100,000</span> tokens. US-only inference costs <span id="usMultiplier">1.1</span>×. Each web search adds <span id="webSearchFee">$0.01</span>. The token counts come from the API's own <code>usage</code> object on every response, which is what Anthropic bills.</p>
+        <p>When Cline or Hermes report a cost themselves, that figure is used instead of the table. A model with no rate card, such as a local model, is <em>unpriced</em>: its requests count toward tokens but not toward cost.</p>
+        <p id="pricingMeta" class="muted"></p>
+        <div class="table-wrap">
+          <table id="rateTable">
+            <thead><tr><th>Model (prefix)</th><th>Input</th><th>Output</th><th>Cache read</th><th>5m write</th><th>1h write</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted">Rates are USD per million tokens.</p>
+        <p id="unpricedNote" class="muted"></p>
+      </div>
+    </dialog>
     <script src="/assets/app.js"></script>
   </body>
 </html>

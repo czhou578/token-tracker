@@ -1,19 +1,46 @@
+import plistlib
 import subprocess
-import typer
+
 import pytest
+import typer
+from typer.testing import CliRunner
 
 import tokentracker.cli.cli as cli
 
 
-def _fake_systemctl(calls):
-    def fake_which(name):
-        return "/usr/bin/systemctl" if name == "systemctl" else None
-
+def _fake_run(calls, stdout=""):
     def fake_run(args, **kwargs):
         calls.append(args)
-        return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, stdout, "")
 
-    return fake_which, fake_run
+    return fake_run
+
+
+def _which(name_to_path):
+    return lambda name: name_to_path.get(name)
+
+
+@pytest.fixture
+def systemd(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cli, "_platform", lambda: "systemd")
+    monkeypatch.setattr(cli.shutil, "which", _which({"systemctl": "/usr/bin/systemctl"}))
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run(calls))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("TOKEN_TRACKER_HOME", str(tmp_path / "home"))
+    return calls
+
+
+@pytest.fixture
+def launchd(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cli, "_platform", lambda: "launchd")
+    monkeypatch.setattr(cli, "_launch_agents_dir", lambda: tmp_path / "LaunchAgents")
+    monkeypatch.setattr(cli, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(cli.shutil, "which", _which({"launchctl": "/bin/launchctl"}))
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run(calls))
+    monkeypatch.setenv("TOKEN_TRACKER_HOME", str(tmp_path / "home"))
+    return calls
 
 
 def test_unit_file_uses_installed_python_and_newlines(monkeypatch):
@@ -36,36 +63,115 @@ def test_systemd_user_dir_defaults_to_dot_config(monkeypatch):
     assert path.parts[-2:] == ("systemd", "user")
 
 
-def test_install_service_writes_unit_and_starts(monkeypatch, tmp_path):
-    calls = []
-    which, run = _fake_systemctl(calls)
-    monkeypatch.setattr(cli.shutil, "which", which)
-    monkeypatch.setattr(cli.subprocess, "run", run)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+def test_install_service_writes_unit_and_restarts(systemd, tmp_path):
     cli.install_service()
     unit = tmp_path / "config" / "systemd" / "user" / "tokentracker.service"
     assert unit.exists()
     assert "ExecStart=" in unit.read_text()
-    assert calls[0] == ["/usr/bin/systemctl", "--user", "daemon-reload"]
-    assert calls[1] == ["/usr/bin/systemctl", "--user", "enable", "--now", "tokentracker.service"]
+    actions = [call[2:] for call in systemd]
+    assert actions == [
+        ["daemon-reload"],
+        ["reset-failed", "tokentracker.service"],
+        ["enable", "tokentracker.service"],
+        ["restart", "tokentracker.service"],
+    ]
+    assert all(call[:2] == ["/usr/bin/systemctl", "--user"] for call in systemd)
 
 
-def test_uninstall_service_stops_disables_and_removes_unit(monkeypatch, tmp_path):
-    calls = []
-    which, run = _fake_systemctl(calls)
-    monkeypatch.setattr(cli.shutil, "which", which)
-    monkeypatch.setattr(cli.subprocess, "run", run)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+def test_uninstall_service_stops_disables_and_removes_unit(systemd, tmp_path):
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit_dir.mkdir(parents=True)
     (unit_dir / "tokentracker.service").write_text("existing")
     cli.uninstall_service()
     assert not (unit_dir / "tokentracker.service").exists()
-    assert calls[0] == ["/usr/bin/systemctl", "--user", "stop", "tokentracker.service"]
-    assert calls[1] == ["/usr/bin/systemctl", "--user", "disable", "tokentracker.service"]
+    assert systemd[0] == ["/usr/bin/systemctl", "--user", "stop", "tokentracker.service"]
+    assert systemd[1] == ["/usr/bin/systemctl", "--user", "disable", "tokentracker.service"]
 
 
 def test_install_service_errors_without_systemctl(monkeypatch):
+    monkeypatch.setattr(cli, "_platform", lambda: "systemd")
     monkeypatch.setattr(cli.shutil, "which", lambda name: None)
     with pytest.raises(typer.Exit):
         cli.install_service()
+
+
+def test_install_service_warns_about_project_venv(systemd, monkeypatch, capsys):
+    monkeypatch.setattr(cli.sys, "executable", "/home/me/project/.venv/bin/python")
+    cli.install_service()
+    assert "project virtual environment" in capsys.readouterr().out
+
+
+def test_install_service_is_quiet_for_tool_install(systemd, monkeypatch, capsys):
+    monkeypatch.setattr(cli.sys, "executable", "/home/me/.local/share/uv/tools/tokentracker/bin/python")
+    cli.install_service()
+    assert "Warning" not in capsys.readouterr().out
+
+
+def test_install_service_refuses_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(cli, "_platform", lambda: "unsupported")
+    with pytest.raises(typer.Exit):
+        cli.install_service()
+
+
+def test_install_service_launchd_writes_plist_and_bootstraps(launchd, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys, "executable", "/opt/tools/bin/python")
+    cli.install_service()
+    plist_path = tmp_path / "LaunchAgents" / "com.tokentracker.collector.plist"
+    assert plist_path.exists()
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert plist["Label"] == "com.tokentracker.collector"
+    assert plist["ProgramArguments"] == ["/opt/tools/bin/python", "-m", "tokentracker.collector.service"]
+    assert plist["RunAtLoad"] is True and plist["KeepAlive"] is True
+    assert plist["StandardOutPath"] == str(tmp_path / "home" / "collector.log")
+    assert launchd == [
+        ["/bin/launchctl", "bootout", "gui/501/com.tokentracker.collector"],
+        ["/bin/launchctl", "bootstrap", "gui/501", str(plist_path)],
+    ]
+
+
+def test_uninstall_service_launchd_boots_out_and_removes_plist(launchd, tmp_path):
+    plist_path = tmp_path / "LaunchAgents" / "com.tokentracker.collector.plist"
+    plist_path.parent.mkdir(parents=True)
+    plist_path.write_bytes(b"existing")
+    cli.uninstall_service()
+    assert not plist_path.exists()
+    assert launchd == [["/bin/launchctl", "bootout", "gui/501/com.tokentracker.collector"]]
+
+
+def test_status_reports_missing_interpreter_and_sources(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "_platform", lambda: "systemd")
+    monkeypatch.setattr(cli.shutil, "which", _which({"systemctl": "/usr/bin/systemctl"}))
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        _fake_run([], stdout="ActiveState=activating\nSubState=auto-restart\nNRestarts=178130\n"),
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("TOKEN_TRACKER_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("TOKEN_TRACKER_CLAUDE_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("TOKEN_TRACKER_HERMES_DB", str(tmp_path / "state.db"))
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "tokentracker.service").write_text(
+        "[Service]\nExecStart=/gone/.venv/bin/python3 -m tokentracker.collector.service\n"
+    )
+    (tmp_path / "claude").mkdir()
+
+    result = CliRunner().invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "activating (auto-restart), restarts: 178130" in result.output
+    assert "/gone/.venv/bin/python3 (MISSING" in result.output
+    assert "claude" in result.output and "[found]" in result.output
+    assert "hermes" in result.output and "[not found]" in result.output
+
+
+def test_status_reports_not_installed(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "_platform", lambda: "systemd")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("TOKEN_TRACKER_HOME", str(tmp_path / "home"))
+
+    result = CliRunner().invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "not installed" in result.output

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tokentracker.collector.parser import (
+    parse_claude_jsonl,
     parse_claude_record,
     parse_cline_record,
     parse_cline_sqlite,
@@ -30,8 +31,77 @@ def test_parse_claude_record_extracts_usage() -> None:
     assert event is not None
     assert event.provider == "claude"
     assert event.conversation_id == "session-1"
-    assert event.thread_id == "message-1"
+    assert event.thread_id == "session-1"  # a thread is the session, not one line
     assert event.total_tokens == 132
+
+
+def test_parse_claude_jsonl_counts_each_response_once(tmp_path) -> None:
+    """Claude Code writes one line per content block; all lines repeat the same usage."""
+    usage = {"input_tokens": 4, "output_tokens": 562, "cache_read_input_tokens": 24174, "cache_creation_input_tokens": 0}
+    lines = [
+        {"type": "user", "uuid": "u0", "sessionId": "s", "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "uuid": "u1", "requestId": "req_1", "sessionId": "s", "timestamp": "2026-10-31T10:00:00.100Z",
+         "message": {"id": "msg_1", "model": "claude-opus-5-5", "usage": usage, "content": [{"type": "thinking"}]}},
+        {"type": "assistant", "uuid": "u2", "requestId": "req_1", "sessionId": "s", "timestamp": "2026-10-31T10:00:00.200Z",
+         "message": {"id": "msg_1", "model": "claude-opus-5-5", "usage": usage, "content": [{"type": "text"}]}},
+        {"type": "assistant", "uuid": "u3", "requestId": "req_1", "sessionId": "s", "timestamp": "2026-10-31T10:00:00.300Z",
+         "message": {"id": "msg_1", "model": "claude-opus-5-5", "usage": usage, "content": [{"type": "tool_use"}]}},
+        {"type": "assistant", "uuid": "u4", "requestId": "req_2", "sessionId": "s", "timestamp": "2026-10-31T10:00:05Z",
+         "message": {"id": "msg_2", "model": "claude-opus-5-5", "usage": usage, "content": [{"type": "text"}]}},
+        # No ids at all: counted per line, as before.
+        {"type": "assistant", "uuid": "u5", "sessionId": "s", "timestamp": "2026-10-31T10:00:06Z",
+         "message": {"model": "claude-opus-5-5", "usage": usage}},
+    ]
+    path = tmp_path / "chat.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    events = list(parse_claude_jsonl(path, tmp_path))
+
+    assert [event.source_id.rsplit(":", 1)[1] for event in events] == ["2", "5", "6"]
+    assert events[0].total_tokens == 4 + 562 + 24174
+    assert json.loads(events[0].metadata_json)["message_id"] == "msg_1"
+    assert {event.thread_id for event in events} == {"s"}
+
+
+def test_parse_claude_record_keeps_pricing_fields() -> None:
+    payload = {
+        "timestamp": "2026-10-31T10:00:00Z",
+        "sessionId": "s",
+        "uuid": "m",
+        "message": {
+            "id": "msg_x",
+            "model": "claude-opus-5-5",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 10,
+                "cache_creation_input_tokens": 1718,
+                "cache_read_input_tokens": 195596,
+                "cache_creation": {"ephemeral_1h_input_tokens": 1718, "ephemeral_5m_input_tokens": 0},
+                "speed": "fast",
+                "inference_geo": "us",
+                "service_tier": "standard",
+                "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
+            },
+        },
+    }
+
+    event = parse_claude_record(payload, Path("chat.jsonl"), 1, Path("."))
+
+    assert event is not None
+    assert json.loads(event.metadata_json) == {
+        "message_id": "msg_x",
+        "cache_write_1h_tokens": 1718,
+        "speed": "fast",
+        "inference_geo": "us",
+        "web_search_requests": 2,
+    }
+
+
+def test_parse_claude_record_omits_default_pricing_fields() -> None:
+    payload = {"message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1, "output_tokens": 1, "speed": "standard", "inference_geo": "global"}}}
+    event = parse_claude_record(payload, Path("chat.jsonl"), 1, Path("."))
+    assert event is not None
+    assert event.metadata_json == "{}"
 
 
 def test_parse_claude_record_ignores_records_without_usage() -> None:
@@ -141,6 +211,18 @@ def test_parse_cline_task_history_extracts_usage(tmp_path) -> None:
             "modelId": "deepseek-v4-flash",
         },
         {
+            "id": "1785782429655",
+            "ulid": "01KZ4ETSZ1KC1Y6V7B02RR11DU",
+            "ts": 1785782945000,
+            "task": "paid task",
+            "tokensIn": 1000,
+            "tokensOut": 100,
+            "cacheWrites": 0,
+            "cacheReads": 0,
+            "totalCost": 0.0123,
+            "modelId": "anthropic/claude-sonnet-5-5",
+        },
+        {
             "id": "1785782429654",
             "ulid": "01KZ4ETSZ1KC1Y6V7B02RR11DT",
             "ts": 1785782944000,
@@ -157,8 +239,10 @@ def test_parse_cline_task_history_extracts_usage(tmp_path) -> None:
 
     events = list(parse_cline_task_history(path))
 
-    assert len(events) == 1
+    assert len(events) == 2
+    assert json.loads(events[1].metadata_json) == {"reported_cost_usd": 0.0123}
     event = events[0]
+    assert event.metadata_json == "{}"
     assert event.provider == "cline"
     assert event.model == "deepseek-v4-flash"
     assert event.thread_id == "01KZ4ETSZ1KC1Y6V7B02RR11DT"
@@ -175,7 +259,7 @@ def test_parse_cline_task_history_skips_missing_file(tmp_path) -> None:
     assert list(parse_cline_task_history(tmp_path / "nope.json")) == []
 
 
-def test_parse_hermes_state_db_reads_finished_sessions(tmp_path) -> None:
+def test_parse_hermes_state_db_reads_finished_and_open_sessions(tmp_path) -> None:
     db_path = tmp_path / "state.db"
     connection = sqlite3.connect(db_path)
     connection.execute(
@@ -196,7 +280,7 @@ def test_parse_hermes_state_db_reads_finished_sessions(tmp_path) -> None:
             "/home/colin-spark/Projects/blog", 100, 20, 5, 7, 3,
         ),
     )
-    # In-progress session (ended_at NULL) must be skipped.
+    # In-progress session (ended_at NULL) is included so usage shows live.
     connection.execute(
         """INSERT INTO sessions (id, source, model, started_at, ended_at, cwd, git_repo_root,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)
@@ -207,10 +291,13 @@ def test_parse_hermes_state_db_reads_finished_sessions(tmp_path) -> None:
     connection.commit()
     connection.close()
 
-    events = list(parse_hermes_state_db(db_path))
+    events = {event.thread_id: event for event in parse_hermes_state_db(db_path)}
 
-    assert len(events) == 1
-    event = events[0]
+    assert set(events) == {"20260807_182535_554eb9", "live_session"}
+    live = events["live_session"]
+    assert live.total_tokens == 1998
+    assert json.loads(live.metadata_json)["ended_at"] is None
+    event = events["20260807_182535_554eb9"]
     assert event.provider == "hermes"
     assert event.model == "deepseek-v4-flash"
     assert event.thread_id == "20260807_182535_554eb9"
@@ -223,6 +310,34 @@ def test_parse_hermes_state_db_reads_finished_sessions(tmp_path) -> None:
     assert event.reasoning_tokens == 3
     assert event.total_tokens == 135
     assert event.timestamp == datetime(2026, 8, 3, 18, 49, 3, 608000, tzinfo=timezone.utc)
+
+
+def test_parse_hermes_state_db_keeps_reported_cost(tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, model TEXT, started_at REAL, ended_at REAL,
+            input_tokens INTEGER, output_tokens INTEGER,
+            estimated_cost_usd REAL, actual_cost_usd REAL, cost_source TEXT
+        )"""
+    )
+    connection.executemany(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("hosted", "cli", "anthropic/claude-sonnet-5-5", 1785782943.6, None, 100, 20, 0.25, 0.31, "provider"),
+            ("local", "cli", "deepseek-v4-flash-0731", 1785782943.6, None, 100, 20, 0.0, None, "none"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    events = {event.thread_id: json.loads(event.metadata_json) for event in parse_hermes_state_db(db_path)}
+
+    assert events["hosted"]["reported_cost_usd"] == 0.31
+    assert events["hosted"]["hermes_cost_source"] == "provider"
+    assert "reported_cost_usd" not in events["local"]
+    assert events["local"]["cwd"] is None  # column absent in this schema
 
 
 def test_parse_hermes_state_db_skips_missing_file(tmp_path) -> None:

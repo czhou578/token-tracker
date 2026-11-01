@@ -6,6 +6,13 @@ from fastapi import APIRouter, Depends, Query
 
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
+from tokentracker.collector.pricing import (
+    LONG_PROMPT_THRESHOLD,
+    PRICING_SOURCE_DATE,
+    US_INFERENCE_MULTIPLIER,
+    WEB_SEARCH_USD_PER_REQUEST,
+    Pricing,
+)
 
 __all__ = ["router"]
 
@@ -67,6 +74,25 @@ for _method in _ROUTE_METHODS:
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/pricing")
+def pricing() -> dict:
+    """The rate table behind `cost_usd`, for the dashboard's cost explainer."""
+    values = get_settings()
+    table = Pricing.load(values.pricing_file)
+    override = values.pricing_file
+    return {
+        "source_date": PRICING_SOURCE_DATE,
+        "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+        "override_file": str(override) if override else None,
+        "override_active": bool(override and override.is_file()),
+        "long_prompt_threshold": LONG_PROMPT_THRESHOLD,
+        "us_inference_multiplier": US_INFERENCE_MULTIPLIER,
+        "web_search_usd_per_request": WEB_SEARCH_USD_PER_REQUEST,
+        "rates": {model: table.table[model] for model in sorted(table.table)},
+        "unpriced_models": get_database().unpriced_models(),
+    }
 
 
 @router.get("/settings")

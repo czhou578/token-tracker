@@ -20,7 +20,15 @@ TOKEN_KEYS = {
 
 
 def parse_claude_jsonl(path: Path, root: Path | None = None) -> Iterable[UsageEvent]:
+    """Yield one usage event per API response in a Claude Code transcript.
+
+    Claude Code writes one line per content block (thinking, text, each
+    tool_use), and every line repeats the response's `message.usage`. Only the
+    first line of each response (same `message.id`, else `requestId`) is kept,
+    so `source_id` stays `path:line_no` of that first line.
+    """
     root = root or path.parent
+    seen_responses: set[str] = set()
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -30,9 +38,25 @@ def parse_claude_jsonl(path: Path, root: Path | None = None) -> Iterable[UsageEv
             except json.JSONDecodeError:
                 continue
 
+            response_id = _claude_response_id(payload)
+            if response_id is not None:
+                if response_id in seen_responses:
+                    continue
+                seen_responses.add(response_id)
+
             event = parse_claude_record(payload, path, line_no, root)
             if event is not None:
                 yield event
+
+
+def _claude_response_id(payload: dict) -> str | None:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id:
+            return message_id
+    request_id = payload.get("requestId")
+    return request_id if isinstance(request_id, str) and request_id else None
 
 
 def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> UsageEvent | None:
@@ -49,7 +73,8 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
     timestamp = _parse_timestamp(payload.get("timestamp") or (message or {}).get("timestamp"))
     model = str(message.get("model") or payload.get("model") or "unknown")
     conversation_id = _first_string(payload, "sessionId", "session_id", "conversation_id", "conversationId")
-    thread_id = _first_string(payload, "uuid", "requestId", "request_id") or conversation_id
+    # A thread is the Claude Code session; `uuid` is unique per line and would count every message.
+    thread_id = conversation_id or _first_string(payload, "requestId", "request_id", "uuid")
     project = _project_from_path(path, root)
     source_id = f"{path.resolve()}:{line_no}"
 
@@ -63,7 +88,44 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
         model=model,
         **token_counts,
         total_tokens=total_tokens,
+        metadata_json=_dumps(_claude_pricing_metadata(usage, message)),
     )
+
+
+def _claude_pricing_metadata(usage: dict, message: object = None) -> dict:
+    """Keep the API message id and the usage fields that change the price of a request.
+
+    - `cache_creation.ephemeral_1h_input_tokens`: 1-hour cache writes cost 2x
+      the input rate, 5-minute writes 1.25x.
+    - `speed`: fast mode has its own rates.
+    - `inference_geo`: US-only inference costs 1.1x.
+    - `server_tool_use.web_search_requests`: each search costs $0.01.
+    """
+    metadata: dict = {}
+    message_id = _first_string(message, "id") if isinstance(message, dict) else None
+    if message_id:
+        metadata["message_id"] = message_id
+    cache_creation = usage.get("cache_creation")
+    if isinstance(cache_creation, dict):
+        write_1h = _int(cache_creation.get("ephemeral_1h_input_tokens"))
+        if write_1h:
+            metadata["cache_write_1h_tokens"] = write_1h
+    speed = usage.get("speed")
+    if isinstance(speed, str) and speed and speed != "standard":
+        metadata["speed"] = speed
+    geo = usage.get("inference_geo")
+    if isinstance(geo, str) and geo and geo != "global":
+        metadata["inference_geo"] = geo
+    server_tools = usage.get("server_tool_use")
+    if isinstance(server_tools, dict):
+        searches = _int(server_tools.get("web_search_requests"))
+        if searches:
+            metadata["web_search_requests"] = searches
+    return metadata
+
+
+def _dumps(metadata: dict) -> str:
+    return json.dumps(metadata, separators=(",", ":")) if metadata else "{}"
 
 
 # ── Cline ────────────────────────────────────────────────────────────────
@@ -198,6 +260,10 @@ def parse_cline_task_history(path: Path) -> Iterable[UsageEvent]:
         thread_id = _first_string(record, "ulid", "id")
         model = _first_string(record, "modelId", "model") or "unknown"
         source_id = f"{path.resolve()}:{record.get('id') or index}"
+        metadata: dict = {}
+        reported_cost = _float(record.get("totalCost"))
+        if reported_cost > 0:
+            metadata["reported_cost_usd"] = reported_cost
 
         yield UsageEvent(
             source_id=source_id,
@@ -208,29 +274,38 @@ def parse_cline_task_history(path: Path) -> Iterable[UsageEvent]:
             model=model,
             **token_counts,
             total_tokens=total_tokens,
+            metadata_json=_dumps(metadata),
         )
+
+
+HERMES_REQUIRED_COLUMNS = frozenset({"id", "model", "started_at", "input_tokens", "output_tokens"})
+HERMES_COLUMNS = (
+    "id", "source", "model", "title", "started_at", "ended_at", "cwd", "git_repo_root",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+    "estimated_cost_usd", "actual_cost_usd", "cost_source",
+)
 
 
 def parse_hermes_state_db(path: Path) -> Iterable[UsageEvent]:
     """Parse Hermes token usage from `~/.hermes/state.db` (SQLite).
 
-    Each row in the `sessions` table is one finished conversation with its
-    aggregate token usage — the analog to Cline's `taskHistory.json`.
-    In-progress sessions (ended_at IS NULL) are skipped because their counts
-    are still changing and the usage database dedupes by `source_id`.
+    Each row in the `sessions` table is one conversation with its aggregate
+    token usage — the analog to Cline's `taskHistory.json`. Open sessions
+    (ended_at IS NULL) are included so usage shows up while Hermes runs;
+    their counts grow over time, so the collector writes them with
+    `UsageDatabase.upsert_events`. Hermes closes a session about a day after
+    it starts, so waiting for `ended_at` would hide a day of usage.
     """
     if not path.is_file():
         return
     connection = sqlite3.connect(str(path))
     connection.row_factory = sqlite3.Row
     try:
-        rows = list(
-            connection.execute(
-                "SELECT id, source, model, title, started_at, ended_at, cwd, git_repo_root, "
-                "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens "
-                "FROM sessions WHERE ended_at IS NOT NULL"
-            )
-        )
+        available = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+        if not HERMES_REQUIRED_COLUMNS <= available:
+            return
+        columns = [column for column in HERMES_COLUMNS if column in available]
+        rows = list(connection.execute(f"SELECT {', '.join(columns)} FROM sessions"))
     except sqlite3.Error:
         return
     finally:
@@ -243,12 +318,17 @@ def parse_hermes_state_db(path: Path) -> Iterable[UsageEvent]:
 
 
 def _hermes_record(row: sqlite3.Row) -> UsageEvent | None:
+    present = set(row.keys())
+
+    def column(name: str) -> object:
+        return row[name] if name in present else None
+
     token_counts = {
-        "prompt_tokens": _int(row["input_tokens"]),
-        "completion_tokens": _int(row["output_tokens"]),
-        "cache_read_tokens": _int(row["cache_read_tokens"]),
-        "cache_write_tokens": _int(row["cache_write_tokens"]),
-        "reasoning_tokens": _int(row["reasoning_tokens"]),
+        "prompt_tokens": _int(column("input_tokens")),
+        "completion_tokens": _int(column("output_tokens")),
+        "cache_read_tokens": _int(column("cache_read_tokens")),
+        "cache_write_tokens": _int(column("cache_write_tokens")),
+        "reasoning_tokens": _int(column("reasoning_tokens")),
     }
     total_tokens = sum(token_counts.values())
     if total_tokens == 0:
@@ -265,15 +345,20 @@ def _hermes_record(row: sqlite3.Row) -> UsageEvent | None:
 
     thread_id = str(row["id"])
     model = str(row["model"] or "unknown")
-    project = _project_from_cwd(row["git_repo_root"] or row["cwd"])
+    project = _project_from_cwd(column("git_repo_root") or column("cwd"))
 
     metadata = {
-        "title": row["title"],
-        "source": row["source"],
-        "cwd": row["cwd"],
-        "git_repo_root": row["git_repo_root"],
-        "ended_at": row["ended_at"],
+        "title": column("title"),
+        "source": column("source"),
+        "cwd": column("cwd"),
+        "git_repo_root": column("git_repo_root"),
+        "ended_at": column("ended_at"),
     }
+    # Hermes prices sessions itself for hosted providers; a local vLLM server reports 0.
+    reported_cost = _float(column("actual_cost_usd")) or _float(column("estimated_cost_usd"))
+    if reported_cost > 0:
+        metadata["reported_cost_usd"] = reported_cost
+        metadata["hermes_cost_source"] = column("cost_source")
 
     return UsageEvent(
         source_id=f"hermes:{thread_id}",
@@ -317,6 +402,13 @@ def _int(value: object) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _float(value: object) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _first_string(payload: dict | None, *keys: str) -> str | None:

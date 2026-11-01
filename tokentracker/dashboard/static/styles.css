@@ -67,7 +67,7 @@ button {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   margin-bottom: 12px;
 }
@@ -78,9 +78,70 @@ button {
   border-radius: 8px;
 }
 
-.cards article { padding: 16px; }
+.cards article { padding: 16px; min-width: 0; }
 .cards span { color: var(--muted); display: block; margin-bottom: 8px; }
+/* Values are formatted compactly in app.js (count/money); the wrap rules below are a last resort. */
 .cards strong { display: block; font-size: clamp(20px, 3vw, 30px); line-height: 1.1; overflow-wrap: anywhere; }
+.cards small { display: block; color: var(--muted); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+.row strong { white-space: nowrap; text-align: right; }
+.row strong small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
+
+.card-title { display: flex; align-items: center; gap: 8px; }
+.help {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font: 700 12px/1 inherit;
+  line-height: 18px;
+  text-align: center;
+}
+.help:hover { color: var(--text); border-color: var(--accent); }
+
+.dialog {
+  width: min(720px, 92vw);
+  max-height: 85vh;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  overflow: hidden;
+}
+.dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.dialog-head h2 { margin: 0; font-size: 16px; }
+.dialog-body { padding: 14px 18px 18px; max-height: calc(85vh - 60px); overflow: auto; }
+.dialog-body p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.dialog-body code { background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+.formula {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+.muted { color: var(--muted); font-size: 12px; }
+.table-wrap { overflow-x: auto; margin: 6px 0 10px; border: 1px solid var(--line); border-radius: 6px; }
+.table-wrap table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.table-wrap th, .table-wrap td { padding: 5px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+.table-wrap th:first-child, .table-wrap td:first-child { text-align: left; }
+.table-wrap th { color: var(--muted); font-weight: 600; background: var(--panel-2); }
+.table-wrap tr:last-child td { border-bottom: 0; }
+.tag { font-size: 10px; color: var(--accent-2); border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
 
 .grid {
   display: grid;

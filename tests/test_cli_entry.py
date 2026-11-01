@@ -15,6 +15,7 @@ def test_cli_reachable_as_module_from_any_cwd(tmp_path):
     assert "dashboard" in result.stdout
     assert "install-service" in result.stdout
     assert "uninstall-service" in result.stdout
+    assert "status" in result.stdout
 
 
 def test_package_entry_reachable_as_module_from_any_cwd(tmp_path):
