@@ -6,6 +6,7 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -214,7 +215,7 @@ class UsageDatabase:
         if not host:
             return 0
         stamped = (
-            event.model_copy(update={"host": host, "source_id": f"{host}::{event.source_id}"})
+            replace(event, host=host, source_id=f"{host}::{event.source_id}")
             for event in events
             if not event.source_id.startswith(f"{host}::")
         )
@@ -263,6 +264,10 @@ class UsageDatabase:
             row = connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return json.loads(row["value"]) if row else None
 
+    def delete_meta(self, key: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM meta WHERE key = ?", (key,))
+
     def _write(self, sql: str, events: Iterable[UsageEvent]) -> int:
         rows = [_event_row(event) for event in events]
         if not rows:
@@ -275,11 +280,9 @@ class UsageDatabase:
     def reprice(self, pricing: "Pricing") -> int:
         """Recompute `cost_usd` for every stored event. Returns the number of rows changed."""
         with self.connect() as connection:
-            rows = connection.execute(
-                f"SELECT id, {', '.join(INSERT_COLUMNS)} FROM usage_events"
-            ).fetchall()
             updates = []
-            for row in rows:
+            # Iterated, not fetched all at once: a list of every row peaked at about 100 MB.
+            for row in connection.execute(f"SELECT id, {', '.join(INSERT_COLUMNS)} FROM usage_events"):
                 event = _event_from_row(row)
                 priced = pricing.price_event(event)
                 if priced.cost_usd != event.cost_usd or priced.metadata_json != event.metadata_json:
@@ -540,11 +543,11 @@ def _enable_wal(connection: sqlite3.Connection) -> bool:
 
 def _event_row(event: UsageEvent) -> tuple[Any, ...]:
     event = event.normalized()
-    values = event.model_dump()
-    if not values.get("host"):
+    values = {column: getattr(event, column) for column in INSERT_COLUMNS}
+    if not values["host"]:
         values["host"] = None  # filled by the caller; NULL rows are stamped with the local hostname on init
     values["timestamp"] = event.timestamp.astimezone(timezone.utc).isoformat()
-    return tuple(values[column] for column in INSERT_COLUMNS)
+    return tuple(values.values())
 
 
 def dedupe_claude_rows(connection: sqlite3.Connection) -> int:

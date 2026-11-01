@@ -21,8 +21,10 @@ events carry `cost_usd = NULL` and the dashboard reports them as unpriced.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -128,6 +130,12 @@ class Pricing:
             return cls(source=path)
         return cls(data, source=path)
 
+    def fingerprint(self) -> str:
+        """A digest that changes whenever a stored cost could: the rates, the overrides, or this code."""
+        digest = hashlib.sha256(Path(__file__).read_bytes())
+        digest.update(json.dumps([self.table, sorted(self.blocked)], sort_keys=True, default=str).encode())
+        return digest.hexdigest()
+
     def resolve(self, model: str | None) -> Rates | None:
         """Return the rate card whose key is the longest prefix of *model*."""
         name = normalize_model(model)
@@ -210,7 +218,7 @@ class Pricing:
                 metadata.pop("cost_source", None)
             else:
                 metadata["cost_source"] = source
-        return event.model_copy(update={"cost_usd": cost, "metadata_json": json.dumps(metadata, separators=(",", ":"))})
+        return replace(event, cost_usd=cost, metadata_json=json.dumps(metadata, separators=(",", ":")))
 
     def price_events(self, events):
         for event in events:

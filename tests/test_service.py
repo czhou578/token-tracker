@@ -41,35 +41,77 @@ def _bump_mtime(path: Path) -> None:
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
 
 
-def test_collector_reparses_only_changed_transcripts(isolated, monkeypatch):
+def test_collector_reads_only_appended_lines(isolated, monkeypatch):
     transcript = isolated / "claude" / "proj" / "a.jsonl"
     transcript.parent.mkdir()
     transcript.write_text(_claude_line("m1", 10))
-    parses: list[Path] = []
-    real_parse = service.parse_claude_jsonl
+    starts: list[int] = []
+    real_read = service.ClaudeTranscript.read
 
-    def counting_parse(path, root=None):
-        parses.append(path)
-        return real_parse(path, root)
+    def recording_read(self, stat=None):
+        starts.append(self._offset)
+        return real_read(self, stat)
 
-    monkeypatch.setattr(service, "parse_claude_jsonl", counting_parse)
+    monkeypatch.setattr(service.ClaudeTranscript, "read", recording_read)
     collector = Collector()
 
     assert collector.scan_once() == 1
     assert collector.scan_once() == 0
-    assert parses == [transcript]
+    assert starts == [0]
 
+    first_size = transcript.stat().st_size
     with transcript.open("a") as handle:
         handle.write(_claude_line("m2", 20))
     _bump_mtime(transcript)
 
     assert collector.scan_once() == 1
-    assert parses == [transcript, transcript]
+    assert starts == [0, first_size]
     assert collector.database.stats()["total_tokens"] == 32
 
     transcript.unlink()
     assert collector.scan_once() == 0
-    assert transcript not in collector._claude_files
+    assert transcript not in collector._transcripts
+
+
+def test_restart_skips_transcripts_unchanged_since_a_clean_shutdown(isolated, monkeypatch):
+    transcript = isolated / "claude" / "proj" / "a.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_text(_claude_line("m1", 10))
+    first = Collector()
+    first.scan_once()
+    first.save_state()
+    first.database.close()
+
+    reads: list[Path] = []
+    real_read = service.ClaudeTranscript.read
+    monkeypatch.setattr(service.ClaudeTranscript, "read", lambda self, stat=None: reads.append(self.path) or real_read(self, stat))
+    second = Collector()
+    assert second.restore_state() == 1
+    assert second.database.get_meta(service.TRANSCRIPTS_META_KEY) is None  # used once
+    assert second.scan_once() == 0
+    assert reads == []
+
+    with transcript.open("a") as handle:
+        handle.write(_claude_line("m2", 20))
+    _bump_mtime(transcript)
+    assert second.scan_once() == 1  # read from the top; the first row is already stored
+    assert second.database.stats()["total_tokens"] == 32
+    assert second.database.stats()["requests"] == 2
+
+
+def test_reprice_runs_only_when_the_pricing_changes(isolated, monkeypatch):
+    collector = Collector()
+    passes: list[int] = []
+    real_reprice = collector.database.reprice
+    monkeypatch.setattr(collector.database, "reprice", lambda pricing: passes.append(1) or real_reprice(pricing))
+
+    collector.reprice()
+    collector.reprice()
+    assert len(passes) == 1
+
+    (isolated / "home" / "pricing.json").write_text(json.dumps({"deepseek-v4-flash": {"input": 0.14, "output": 0.28}}))
+    collector.scan_once()  # reloads the overrides
+    assert len(passes) == 2
 
 
 def test_collector_releases_memory_only_after_a_parse(isolated, monkeypatch):

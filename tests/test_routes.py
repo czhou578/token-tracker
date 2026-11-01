@@ -97,3 +97,22 @@ def test_requests_share_one_database_and_release_memory(client, monkeypatch) -> 
         assert http.get(path).status_code == 200
     assert inits == []
     assert len(releases) == 4
+
+
+def test_ingest_prices_events_with_this_machines_rates(client) -> None:
+    http, home = client
+    (home / "ingest_token").write_text("secret\n")
+    sent = EVENT | {"source_id": "s:2", "cost_usd": 999.0}
+    response = http.post("/api/events", json={"host": "laptop", "events": [sent]}, headers={"Authorization": "Bearer secret"})
+    assert response.status_code == 200
+
+    cost = http.get("/api/stats", params={"host": "laptop"}).json()["cost_usd"]
+    assert abs(cost - 10 * 4 / 1_000_000) < 1e-12  # claude-opus-5-5 input rate, not the sender's 999
+
+
+def test_ingest_rejects_an_event_with_a_bad_field(client) -> None:
+    http, home = client
+    (home / "ingest_token").write_text("secret\n")
+    bad = EVENT | {"prompt_tokens": "lots"}
+    response = http.post("/api/events", json={"host": "laptop", "events": [bad]}, headers={"Authorization": "Bearer secret"})
+    assert response.status_code == 422

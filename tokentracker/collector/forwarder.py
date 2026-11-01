@@ -13,8 +13,7 @@ import hashlib
 import json
 import logging
 import time
-import urllib.error
-import urllib.request
+from dataclasses import asdict
 from typing import Any
 
 from tokentracker.collector.config import Settings
@@ -55,7 +54,8 @@ def export_event(event: UsageEvent, settings: Settings) -> dict[str, Any]:
     project = event.project
     if settings.project_labels == "hash":
         project = hashed_project(project, settings.project_salt)
-    data = event.model_dump(mode="json")
+    data = asdict(event)
+    data["timestamp"] = event.timestamp.isoformat()
     data["project"] = project
     data["host"] = settings.hostname
     data["metadata_json"] = json.dumps(kept, separators=(",", ":")) if kept else "{}"
@@ -69,19 +69,28 @@ class Forwarder:
         self._next_attempt = 0.0
         self._backoff = BACKOFF_START
         self._warned = False
+        # Unknown at start, so the first flush looks. After that, only new local
+        # events or an unfinished backlog make a flush query the database.
+        self._pending = True
 
     @property
     def enabled(self) -> bool:
         return bool(self.settings.remote_url and self.settings.remote_token)
 
+    def notify(self) -> None:
+        """Record that local events were written, so the next flush sends them."""
+        self._pending = True
+
     def flush(self) -> int:
         """Send pending events; return how many the remote accepted this call."""
-        if not self.enabled or time.monotonic() < self._next_attempt:
+        if not self.enabled or not self._pending or time.monotonic() < self._next_attempt:
             return 0
         sent = 0
+        drained = False
         for _ in range(MAX_BATCHES_PER_FLUSH):
             pending = self.database.pending_forward(BATCH_SIZE)
             if not pending:
+                drained = True
                 break
             ids = [row_id for row_id, _ in pending]
             payload = {
@@ -90,7 +99,7 @@ class Forwarder:
             }
             try:
                 self._post(payload)
-            except (urllib.error.URLError, OSError, ValueError) as error:
+            except (OSError, ValueError) as error:  # urllib's URLError and HTTPError are OSErrors
                 self._backoff = min(self._backoff * 2, BACKOFF_MAX) if self._warned else BACKOFF_START
                 self._next_attempt = time.monotonic() + self._backoff
                 self.database.set_meta(META_LAST_ERROR, {"at": time.time(), "error": str(error)[:300]})
@@ -101,7 +110,9 @@ class Forwarder:
             self.database.mark_forwarded(ids)
             sent += len(ids)
             if len(pending) < BATCH_SIZE:
+                drained = True
                 break
+        self._pending = not drained
         if sent:
             self.database.set_meta(META_LAST_OK, {"at": time.time(), "sent": sent})
             if self._warned:
@@ -111,6 +122,10 @@ class Forwarder:
         return sent
 
     def _post(self, payload: dict[str, Any]) -> None:
+        # Imported here: urllib.request loads ssl (about 2.6 MB), and most
+        # collectors (the main machine) never forward.
+        import urllib.request
+
         request = urllib.request.Request(
             f"{self.settings.remote_url}/api/events",
             data=json.dumps(payload).encode("utf-8"),

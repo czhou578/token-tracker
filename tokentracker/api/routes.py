@@ -132,7 +132,8 @@ async def ingest(request: Request) -> dict[str, int]:
     checked before the body is read or validated: an unauthenticated caller
     learns nothing about the request format.
     """
-    token = load_ingest_token(get_settings())
+    settings = get_settings()
+    token = load_ingest_token(settings)
     if token is None:
         raise HTTPException(status_code=404, detail="Not Found")
     if not authorized(request.headers.get("authorization"), token):
@@ -148,7 +149,10 @@ async def ingest(request: Request) -> dict[str, int]:
     except ValidationError as error:
         raise HTTPException(status_code=422, detail=error.errors(include_url=False, include_input=False)) from None
     database = get_database(request)
-    accepted = await run_in_threadpool(database.ingest_events, batch.host, batch.events)
+    # Priced here with this machine's rates: the collector reprices stored rows
+    # only when the rates change, so it would never correct a sender's prices.
+    pricing = Pricing.load(settings.pricing_file)
+    accepted = await run_in_threadpool(database.ingest_events, batch.host, pricing.price_events(batch.events))
     return {"accepted": accepted, "received": len(batch.events)}
 
 

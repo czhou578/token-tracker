@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import json
@@ -52,7 +53,7 @@ def test_upsert_refreshes_changed_rows_only(tmp_path) -> None:
     assert database.upsert_events([first]) == 1
     assert database.upsert_events([first]) == 0
 
-    grown = first.model_copy(update={"prompt_tokens": 300, "completion_tokens": 50, "total_tokens": 0})
+    grown = replace(first, prompt_tokens=300, completion_tokens=50, total_tokens=0)
     assert database.upsert_events([grown]) == 1
 
     stats = database.stats(provider="hermes")

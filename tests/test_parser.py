@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tokentracker.collector.parser import (
+    ClaudeTranscript,
     parse_claude_jsonl,
     parse_claude_record,
     parse_cline_record,
@@ -342,3 +343,73 @@ def test_parse_hermes_state_db_keeps_reported_cost(tmp_path) -> None:
 
 def test_parse_hermes_state_db_skips_missing_file(tmp_path) -> None:
     assert list(parse_hermes_state_db(tmp_path / "nope.db")) == []
+
+
+def _assistant(message_id: str, block: str, tokens: int = 7) -> str:
+    return json.dumps({
+        "type": "assistant", "sessionId": "s", "timestamp": "2026-10-31T10:00:00Z",
+        "message": {"id": message_id, "model": "claude-opus-5-5", "usage": {"input_tokens": tokens, "output_tokens": 1},
+                    "content": [{"type": block}]},
+    }) + "\n"
+
+
+def test_transcript_reads_match_a_full_parse(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    reader = ClaudeTranscript(path, tmp_path)
+    path.write_text(_assistant("msg_1", "thinking") + "\n")
+    first = reader.read()
+    # The rest of msg_1 arrives in the next read: it must not count again.
+    with path.open("a") as handle:
+        handle.write(_assistant("msg_1", "text") + _assistant("msg_2", "text"))
+    second = reader.read()
+    assert reader.read() == []
+
+    ids = [event.source_id.rsplit(":", 1)[1] for event in first + second]
+    assert ids == ["1", "4"]
+    assert [event.source_id for event in first + second] == [event.source_id for event in parse_claude_jsonl(path, tmp_path)]
+
+
+def test_transcript_waits_for_a_line_being_written(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    line = _assistant("msg_1", "text")
+    path.write_text(line[:20])
+    reader = ClaudeTranscript(path, tmp_path)
+    assert reader.read() == []
+
+    with path.open("a") as handle:
+        handle.write(line[20:] + _assistant("msg_2", "text"))
+    events = reader.read()
+    assert [event.source_id.rsplit(":", 1)[1] for event in events] == ["1", "2"]
+
+
+def test_transcript_counts_a_final_line_without_newline_once(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    path.write_text(_assistant("msg_1", "text").rstrip("\n"))
+    reader = ClaudeTranscript(path, tmp_path)
+    assert len(reader.read()) == 1
+    with path.open("a") as handle:
+        handle.write("\n" + _assistant("msg_2", "text"))
+    events = reader.read()
+    assert [event.source_id.rsplit(":", 1)[1] for event in events] == ["2"]
+
+
+def test_transcript_starts_over_when_shrunk_or_rewritten(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    path.write_text(_assistant("msg_1", "text") + _assistant("msg_2", "text"))
+    reader = ClaudeTranscript(path, tmp_path)
+    assert len(reader.read()) == 2
+
+    path.write_text(_assistant("msg_3", "text"))  # shorter: truncated and rewritten
+    events = reader.read()
+    assert [json.loads(event.metadata_json)["message_id"] for event in events] == ["msg_3"]
+
+    # Same length or longer but different content: the byte before the offset is no longer a newline.
+    path.write_text(_assistant("msg_4", "text", tokens=12345) + _assistant("msg_5", "text"))
+    events = reader.read()
+    assert [json.loads(event.metadata_json)["message_id"] for event in events] == ["msg_4", "msg_5"]
+
+
+def test_transcript_ignores_lines_that_are_not_objects(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    path.write_text("[1, 2]\n" + _assistant("msg_1", "text"))
+    assert len(parse_claude_jsonl(path, tmp_path)) == 1

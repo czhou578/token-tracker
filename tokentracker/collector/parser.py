@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,34 +20,87 @@ TOKEN_KEYS = {
 }
 
 
-def parse_claude_jsonl(path: Path, root: Path | None = None) -> Iterable[UsageEvent]:
-    """Yield one usage event per API response in a Claude Code transcript.
+def parse_claude_jsonl(path: Path, root: Path | None = None) -> list[UsageEvent]:
+    """Return one usage event per API response in a Claude Code transcript.
 
     Claude Code writes one line per content block (thinking, text, each
     tool_use), and every line repeats the response's `message.usage`. Only the
     first line of each response (same `message.id`, else `requestId`) is kept,
     so `source_id` stays `path:line_no` of that first line.
     """
-    root = root or path.parent
-    seen_responses: set[str] = set()
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    return ClaudeTranscript(path, root or path.parent).read()
 
-            response_id = _claude_response_id(payload)
-            if response_id is not None:
-                if response_id in seen_responses:
-                    continue
-                seen_responses.add(response_id)
 
-            event = parse_claude_record(payload, path, line_no, root)
-            if event is not None:
-                yield event
+class ClaudeTranscript:
+    """Reads one Claude Code transcript incrementally.
+
+    Claude Code only appends to a transcript, so each `read` parses just the
+    lines added since the previous one, and the collector never reads a long
+    session's file from the top again. Only complete lines are consumed; a
+    line still being written is parsed again on the next read under the same
+    line number. When the file shrinks, is replaced, or no longer ends a line
+    where the last read stopped, the next read starts over from the top (the
+    database ignores rows it already has).
+    """
+
+    def __init__(self, path: Path, root: Path):
+        self.path = path
+        # Computed once: resolve() costs a syscall per path component.
+        self._source = str(path.resolve())
+        self._project = _project_from_path(path, root)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget all progress, so the next read starts from the top."""
+        self.signature: tuple[int, int, int] | None = None  # (inode, size, mtime_ns) at the last read
+        self._offset = 0  # bytes consumed, always just past a newline
+        self._line_no = 0  # lines consumed, so source ids match a full parse
+        self._seen: set[str] = set()  # response ids already counted
+
+    def changed(self, stat: os.stat_result) -> bool:
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns) != self.signature
+
+    def read(self, stat: os.stat_result | None = None) -> list[UsageEvent]:
+        """Parse the lines appended since the last read and return their events."""
+        stat = stat or self.path.stat()
+        if self.signature is not None and (stat.st_ino != self.signature[0] or stat.st_size < self._offset):
+            self.reset()
+        events: list[UsageEvent] = []
+        with self.path.open("rb") as handle:
+            if self._offset:
+                handle.seek(self._offset - 1)
+                if handle.read(1) != b"\n":  # rewritten in place
+                    self.reset()
+                    handle.seek(0)
+            line_no = self._line_no
+            for raw in handle:
+                line_no += 1
+                event = self._parse(raw, line_no)
+                if event is not None:
+                    events.append(event)
+                if not raw.endswith(b"\n"):
+                    break  # still being written; a complete line here was counted once via _seen
+                self._offset += len(raw)
+                self._line_no = line_no
+        self.signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        return events
+
+    def _parse(self, raw: bytes, line_no: int) -> UsageEvent | None:
+        line = raw.decode("utf-8", errors="ignore")
+        if not line.strip():
+            return None
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        response_id = _claude_response_id(payload)
+        if response_id is not None:
+            if response_id in self._seen:
+                return None
+            self._seen.add(response_id)
+        return _claude_event(payload, f"{self._source}:{line_no}", self._project)
 
 
 def _claude_response_id(payload: dict) -> str | None:
@@ -60,8 +114,14 @@ def _claude_response_id(payload: dict) -> str | None:
 
 
 def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> UsageEvent | None:
+    return _claude_event(payload, f"{path.resolve()}:{line_no}", _project_from_path(path, root))
+
+
+def _claude_event(payload: dict, source_id: str, project: str | None) -> UsageEvent | None:
     message = payload.get("message")
-    usage = message.get("usage") if isinstance(message, dict) else payload.get("usage")
+    if not isinstance(message, dict):
+        message = None
+    usage = message.get("usage") if message is not None else payload.get("usage")
     if not isinstance(usage, dict):
         return None
 
@@ -70,13 +130,12 @@ def parse_claude_record(payload: dict, path: Path, line_no: int, root: Path) -> 
     if total_tokens == 0:
         return None
 
-    timestamp = _parse_timestamp(payload.get("timestamp") or (message or {}).get("timestamp"))
+    message = message or {}
+    timestamp = _parse_timestamp(payload.get("timestamp") or message.get("timestamp"))
     model = str(message.get("model") or payload.get("model") or "unknown")
     conversation_id = _first_string(payload, "sessionId", "session_id", "conversation_id", "conversationId")
     # A thread is the Claude Code session; `uuid` is unique per line and would count every message.
     thread_id = conversation_id or _first_string(payload, "requestId", "request_id", "uuid")
-    project = _project_from_path(path, root)
-    source_id = f"{path.resolve()}:{line_no}"
 
     return UsageEvent(
         source_id=source_id,
