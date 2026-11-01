@@ -4,8 +4,9 @@ import hmac
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from tokentracker.collector.config import Settings, get_settings
 from tokentracker.collector.models import UsageEvent
@@ -35,6 +36,7 @@ def _filters(
     thread_id: str | None = Query(None),
     provider: str | None = Query(None),
     host: str | None = Query(None),
+    tz: str | None = Query(None, max_length=64),
 ) -> dict[str, str | None]:
     return {
         "window": window,
@@ -43,6 +45,7 @@ def _filters(
         "thread_id": thread_id,
         "provider": provider,
         "host": host,
+        "tz": tz,
     }
 
 
@@ -92,6 +95,7 @@ def hosts(database: UsageDatabase = Depends(get_database)) -> list[dict]:
 # ── ingest: events pushed from another machine ──────────────────────────
 
 MAX_INGEST_BATCH = 1000
+MAX_INGEST_BYTES = 8 * 1024 * 1024  # a 500-event batch is about 0.3 MB
 
 
 class IngestBatch(BaseModel):
@@ -121,18 +125,30 @@ def authorized(authorization: str | None, token: str) -> bool:
 
 
 @router.post("/events")
-def ingest(
-    batch: IngestBatch,
-    authorization: str | None = Header(default=None),
-    database: UsageDatabase = Depends(get_database),
-) -> dict[str, int]:
-    """Accept usage events from another machine (see `tracker link`)."""
+async def ingest(request: Request) -> dict[str, int]:
+    """Accept usage events from another machine (see `tracker link`).
+
+    This path is public when exposed through Tailscale Funnel, so the token is
+    checked before the body is read or validated: an unauthenticated caller
+    learns nothing about the request format.
+    """
     token = load_ingest_token(get_settings())
     if token is None:
-        raise HTTPException(status_code=404, detail="ingest is not enabled on this tracker")
-    if not authorized(authorization, token):
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not authorized(request.headers.get("authorization"), token):
         raise HTTPException(status_code=401, detail="bad or missing bearer token")
-    accepted = database.ingest_events(batch.host, batch.events)
+    declared = request.headers.get("content-length")
+    if declared is not None and (not declared.isdigit() or int(declared) > MAX_INGEST_BYTES):
+        raise HTTPException(status_code=413, detail="batch too large")
+    body = await request.body()
+    if len(body) > MAX_INGEST_BYTES:
+        raise HTTPException(status_code=413, detail="batch too large")
+    try:
+        batch = IngestBatch.model_validate_json(body)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=error.errors(include_url=False, include_input=False)) from None
+    database = get_database()
+    accepted = await run_in_threadpool(database.ingest_events, batch.host, batch.events)
     return {"accepted": accepted, "received": len(batch.events)}
 
 

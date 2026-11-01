@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import json
 import sqlite3
@@ -227,28 +227,25 @@ def test_fresh_database_marks_migration_done_without_backup(tmp_path) -> None:
 
 
 def test_series_buckets_follow_the_window(tmp_path) -> None:
+    from tokentracker.collector.database import bucket_unit
+
+    assert bucket_unit("90d") == "week" and bucket_unit("7d") == "day" and bucket_unit("today") == "hour"
     database = UsageDatabase(tmp_path / "usage.db")
     database.insert_events(
         [
-            UsageEvent(source_id="a", provider="claude", prompt_tokens=10, timestamp=datetime(2026, 10, 5, 9, tzinfo=timezone.utc)),   # Monday
-            UsageEvent(source_id="b", provider="claude", prompt_tokens=20, timestamp=datetime(2026, 10, 11, 23, tzinfo=timezone.utc)),  # Sunday, same week
-            UsageEvent(source_id="c", provider="claude", prompt_tokens=40, timestamp=datetime(2026, 10, 12, 1, tzinfo=timezone.utc)),   # next Monday
-            UsageEvent(source_id="d", provider="claude", prompt_tokens=80, timestamp=datetime(2026, 11, 1, 1, tzinfo=timezone.utc)),
+            UsageEvent(source_id="a", provider="claude", prompt_tokens=10, timestamp=datetime(2026, 7, 5, 9, tzinfo=timezone.utc)),
+            UsageEvent(source_id="b", provider="claude", prompt_tokens=20, timestamp=datetime(2026, 9, 11, 23, tzinfo=timezone.utc)),
         ]
     )
 
-    by_week = database.series(window=None)
-    assert by_week["unit"] == "month"
-    assert [(row["period"], row["total_tokens"]) for row in by_week["rows"]] == [("2026-10-01", 70), ("2026-11-01", 80)]
+    result = database.series(window=None, tz="UTC")
 
-    from tokentracker.collector.database import BUCKET_EXPRESSIONS, bucket_unit
-
-    assert bucket_unit("90d") == "week" and bucket_unit("7d") == "day" and bucket_unit("today") == "hour"
-    weeks = database._grouped(BUCKET_EXPRESSIONS["week"], "period", {})
-    assert sorted((row["period"], row["total_tokens"]) for row in weeks) == [("2026-10-05", 30), ("2026-10-12", 40), ("2026-10-26", 80)]
-    days = database._grouped(BUCKET_EXPRESSIONS["day"], "period", {})
-    assert len(days) == 4
-
+    assert result["unit"] == "month" and result["tz"] == "UTC"
+    rows = [(row["period"], row["total_tokens"]) for row in result["rows"]]
+    # Every month from the first event to now, empty months included.
+    assert rows[:3] == [("2026-07-01", 10), ("2026-08-01", 0), ("2026-09-01", 20)]
+    assert rows[-1][0] == datetime.now(timezone.utc).strftime("%Y-%m-01")
+    assert all(row["cost_usd"] is None for row in result["rows"])
 
 def test_host_column_is_stamped_and_filterable(tmp_path) -> None:
     database = UsageDatabase(tmp_path / "usage.db", hostname="spark")
@@ -294,3 +291,84 @@ def test_pending_forward_tracks_local_unsynced_rows(tmp_path) -> None:
     assert database.pending_forward_count() == 1
     database.set_meta("k", {"n": 1})
     assert database.get_meta("k") == {"n": 1} and database.get_meta("missing") is None
+
+
+def test_window_bounds_use_local_calendar_days() -> None:
+    from zoneinfo import ZoneInfo
+
+    from tokentracker.collector.database import _window_bounds
+
+    la = ZoneInfo("America/Los_Angeles")
+    now = datetime(2026, 11, 1, 0, 57, tzinfo=timezone.utc)  # Oct 31, 17:57 PDT
+    utc = lambda *args: datetime(*args, tzinfo=timezone.utc)  # noqa: E731
+    assert _window_bounds("today", la, now) == (utc(2026, 10, 31, 7), None)
+    assert _window_bounds("yesterday", la, now) == (utc(2026, 10, 30, 7), utc(2026, 10, 31, 7))
+    assert _window_bounds("7d", la, now) == (utc(2026, 10, 25, 7), None)
+    assert _window_bounds(None, la, now) == (None, None)
+    # Across the end of daylight saving (Nov 1, 2026): local midnight moves from 07:00Z to 08:00Z.
+    later = datetime(2026, 11, 2, 20, 0, tzinfo=timezone.utc)
+    assert _window_bounds("today", la, later) == (utc(2026, 11, 2, 8), None)
+    assert _window_bounds("7d", la, later) == (utc(2026, 10, 27, 7), None)
+
+
+def test_bucket_range_handles_dst_and_partial_periods() -> None:
+    from zoneinfo import ZoneInfo
+
+    from tokentracker.collector.database import _bucket_range, _local_midnight
+
+    la = ZoneInfo("America/Los_Angeles")
+    day = datetime(2026, 11, 1).date()
+    start = _local_midnight(day, la)
+    end = _local_midnight(day + timedelta(days=1), la) - timedelta(microseconds=1)
+    hours = _bucket_range(start, end, "hour", la)
+    assert len(hours) == 24 and hours[0] == "2026-11-01T00:00" and hours[-1] == "2026-11-01T23:00"
+    assert len(set(hours)) == 24  # the repeated 01:00 hour appears once
+
+    weeks = _bucket_range(_local_midnight(datetime(2026, 8, 5).date(), la), _local_midnight(datetime(2026, 8, 20).date(), la), "week", la)
+    assert weeks == ["2026-08-03", "2026-08-10", "2026-08-17"]
+    months = _bucket_range(_local_midnight(datetime(2026, 11, 15).date(), la), _local_midnight(datetime(2027, 2, 1).date(), la), "month", la)
+    assert months == ["2026-11-01", "2026-12-01", "2027-01-01", "2027-02-01"]
+
+
+def test_series_today_has_24_local_hours(tmp_path) -> None:
+    from zoneinfo import ZoneInfo
+
+    database = UsageDatabase(tmp_path / "usage.db")
+    now = datetime.now(timezone.utc)
+    database.insert_events([UsageEvent(source_id="now", provider="claude", prompt_tokens=7, timestamp=now)])
+
+    # Asia/Kolkata (+05:30) has no DST and a half-hour offset.
+    result = database.series(window="today", tz="Asia/Kolkata")
+
+    assert result["unit"] == "hour" and len(result["rows"]) == 24
+    local_hour = now.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:00")
+    by_period = {row["period"]: row["total_tokens"] for row in result["rows"]}
+    assert by_period[local_hour] == 7
+    assert sum(by_period.values()) == 7
+    assert database.stats(window="today", tz="Asia/Kolkata")["total_tokens"] == 7
+
+
+def test_series_seven_days_has_seven_daily_bars(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db")
+    now = datetime.now(timezone.utc)
+    database.insert_events(
+        [
+            UsageEvent(source_id="a", provider="claude", prompt_tokens=5, timestamp=now),
+            UsageEvent(source_id="b", provider="claude", prompt_tokens=9, timestamp=now - timedelta(days=30)),
+        ]
+    )
+
+    result = database.series(window="7d", tz="UTC")
+
+    assert result["unit"] == "day" and len(result["rows"]) == 7
+    assert result["rows"][-1]["period"] == now.date().isoformat()
+    assert sum(row["total_tokens"] for row in result["rows"]) == 5
+
+
+def test_resolve_tz_falls_back_for_unknown_names() -> None:
+    from tokentracker.collector.database import resolve_tz
+
+    assert getattr(resolve_tz("America/New_York"), "key", None) == "America/New_York"
+    assert resolve_tz("Not/AZone") is not None
+    assert resolve_tz("../../etc/passwd") is not None
+    assert resolve_tz(None) is not None

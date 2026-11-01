@@ -24,6 +24,14 @@ const ids = {
 };
 
 const fmt = new Intl.NumberFormat();
+// Windows ("Today", "7 days") and chart buckets are computed in this timezone on the server.
+const TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+})();
 const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
 // Whole numbers with separators up to 999,999,999; from one billion, "1.23B".
@@ -44,6 +52,7 @@ async function get(path) {
   const params = new URLSearchParams();
   if (ids.window.value) params.set("window", ids.window.value);
   if (ids.host.value) params.set("host", ids.host.value);
+  if (TIME_ZONE) params.set("tz", TIME_ZONE);
   const query = params.toString();
   const response = await fetch(`/api/${path}${query ? `?${query}` : ""}`);
   if (!response.ok) throw new Error(`Failed to load ${path}`);
@@ -107,7 +116,7 @@ function periodLabel(period, unit) {
 
 function periodTitle(period, unit) {
   const text = String(period);
-  if (unit === "hour") return `${text.slice(0, 10)} ${text.slice(11, 16)} UTC`;
+  if (unit === "hour") return `${text.slice(0, 10)} ${text.slice(11, 16)}`;
   if (unit === "week") return `week of ${text.slice(0, 10)}`;
   if (unit === "month") return text.slice(0, 7);
   return text.slice(0, 10);
@@ -130,8 +139,9 @@ function renderSeries(series) {
   const step = Math.max(1, Math.ceil(rows.length / MAX_AXIS_LABELS));
   rows.forEach((row, index) => {
     const bar = document.createElement("div");
-    bar.className = "bar";
-    bar.style.height = `${Math.max(2, ((row.total_tokens || 0) / max) * 100)}%`;
+    const tokens = row.total_tokens || 0;
+    bar.className = tokens ? "bar" : "bar zero";
+    bar.style.height = tokens ? `${Math.max(2, (tokens / max) * 100)}%` : "2px";
     bar.title = `${periodTitle(row.period, unit)}: ${fmt.format(row.total_tokens || 0)} tokens, ${money(row.cost_usd)}, ${fmt.format(row.requests || 0)} requests`;
     if (index % step === 0) {
       bar.innerHTML = `<span>${periodLabel(row.period, unit)}</span>`;

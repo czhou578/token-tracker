@@ -5,9 +5,10 @@ import socket
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tokentracker.collector.models import UsageEvent
 
@@ -294,15 +295,68 @@ class UsageDatabase:
         return self._grouped("date(timestamp)", "day", filters)
 
     def series(self, **filters: Any) -> dict[str, Any]:
-        """Token totals over time, bucketed to suit the window.
+        """Token totals over time, bucketed to suit the window, in the viewer's timezone.
 
-        Short windows get hours or days; 90 days gets weeks; all time gets
-        months. That keeps the chart to a few dozen bars at most.
+        Today and yesterday get 24 hourly buckets; 7 and 30 days get daily
+        buckets; 90 days gets weeks starting on Monday; all time gets months.
+        Every bucket in the range is returned, empty ones with zeros, so the
+        chart keeps a stable axis.
+
+        SQLite only knows UTC, so rows are first summed into 15-minute UTC
+        slots (fine enough for every real timezone offset) and then mapped to
+        local buckets with zoneinfo, which also handles daylight-saving changes.
         """
-        unit = bucket_unit(filters.get("window"))
-        rows = self._grouped(BUCKET_EXPRESSIONS[unit], "period", filters)
-        rows.sort(key=lambda row: str(row["period"]))
-        return {"unit": unit, "rows": rows}
+        window = filters.get("window")
+        tz = resolve_tz(filters.get("tz"))
+        unit = bucket_unit(window)
+        where, values = self._filters(filters)
+        with self.connect() as connection:
+            slots = connection.execute(
+                f"""
+                SELECT strftime('%Y-%m-%dT%H:', timestamp)
+                         || printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER) / 15) * 15) AS slot,
+                       SUM(total_tokens) AS total_tokens,
+                       SUM(prompt_tokens) AS prompt_tokens,
+                       SUM(completion_tokens) AS completion_tokens,
+                       SUM(cost_usd) AS cost_usd,
+                       COUNT(cost_usd) AS priced_requests,
+                       COUNT(*) AS requests
+                FROM usage_events {where}
+                GROUP BY slot
+                """,
+                values,
+            ).fetchall()
+
+        buckets: dict[str, dict[str, Any]] = {}
+        first_local: datetime | None = None
+        for slot in slots:
+            if slot["slot"] is None:
+                continue
+            local = datetime.strptime(slot["slot"], "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).astimezone(tz)
+            first_local = local if first_local is None or local < first_local else first_local
+            bucket = buckets.setdefault(_bucket_key(local, unit), _empty_bucket())
+            for column in ("total_tokens", "prompt_tokens", "completion_tokens", "priced_requests", "requests"):
+                bucket[column] += slot[column] or 0
+            if slot["cost_usd"] is not None:
+                bucket["cost_usd"] = (bucket["cost_usd"] or 0.0) + slot["cost_usd"]
+
+        since, until = _window_bounds(window, tz)
+        if since is None:
+            if first_local is None:
+                return {"unit": unit, "tz": _tz_name(tz), "rows": []}
+            since = first_local
+        end = until - timedelta(microseconds=1) if until is not None else datetime.now(tz)
+        if unit == "hour":
+            # Whole local day, so today's chart shows the hours still to come.
+            start_day = since.astimezone(tz).date()
+            end = _local_midnight(start_day + timedelta(days=1), tz) - timedelta(microseconds=1)
+        keys = _bucket_range(since.astimezone(tz), end.astimezone(tz), unit, tz)
+        for key in buckets:  # never drop data that falls outside the generated range
+            if key not in keys:
+                keys.append(key)
+        keys.sort()
+        rows = [{"period": key, **buckets.get(key, _empty_bucket())} for key in keys]
+        return {"unit": unit, "tz": _tz_name(tz), "rows": rows}
 
     def models(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("COALESCE(model, 'unknown')", "model", filters)
@@ -380,7 +434,7 @@ class UsageDatabase:
     def _filters(self, filters: dict[str, Any]) -> tuple[str, tuple[Any, ...]]:
         clauses: list[str] = []
         values: list[Any] = []
-        since, until = _window_bounds(filters.get("window"))
+        since, until = _window_bounds(filters.get("window"), resolve_tz(filters.get("tz")))
         if since is not None:
             clauses.append("timestamp >= ?")
             values.append(since.isoformat())
@@ -505,16 +559,6 @@ def _dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [_dict(row) for row in rows]
 
 
-# Bucket start as an ISO string. Weeks start on Monday: 'weekday 0' moves to
-# the next Sunday, then six days back.
-BUCKET_EXPRESSIONS = {
-    "hour": "strftime('%Y-%m-%dT%H:00', timestamp)",
-    "day": "date(timestamp)",
-    "week": "date(timestamp, 'weekday 0', '-6 days')",
-    "month": "strftime('%Y-%m-01', timestamp)",
-}
-
-
 def bucket_unit(window: str | None) -> str:
     match window:
         case "today" | "yesterday":
@@ -527,19 +571,104 @@ def bucket_unit(window: str | None) -> str:
             return "month"
 
 
-def _window_bounds(window: str | None) -> tuple[datetime | None, datetime | None]:
-    now = datetime.now(timezone.utc)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+def resolve_tz(name: str | None) -> tzinfo:
+    """The viewer's timezone from an IANA name (e.g. 'America/Los_Angeles').
+
+    Falls back to this machine's local timezone when the name is missing or unknown.
+    """
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _tz_name(tz: tzinfo) -> str:
+    return getattr(tz, "key", None) or str(tz)
+
+
+def _local_midnight(day: date, tz: tzinfo) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=tz)
+
+
+def _window_bounds(
+    window: str | None, tz: tzinfo | None = None, now: datetime | None = None
+) -> tuple[datetime | None, datetime | None]:
+    """UTC bounds of a window measured in whole local calendar days.
+
+    "7d" means today plus the six days before it, so the chart shows exactly
+    seven daily bars and the totals match the bars.
+    """
+    tz = tz or resolve_tz(None)
+    today = (now or datetime.now(timezone.utc)).astimezone(tz).date()
+
+    def start(days_back: int) -> datetime:
+        return _local_midnight(today - timedelta(days=days_back), tz).astimezone(timezone.utc)
+
     match window:
         case "today":
-            return today, None
+            return start(0), None
         case "yesterday":
-            return today - timedelta(days=1), today
+            return start(1), start(0)
         case "7d" | "week":
-            return now - timedelta(days=7), None
+            return start(6), None
         case "30d" | "month":
-            return now - timedelta(days=30), None
+            return start(29), None
         case "90d":
-            return now - timedelta(days=90), None
+            return start(89), None
         case _:
             return None, None
+
+
+def _bucket_key(local: datetime, unit: str) -> str:
+    match unit:
+        case "hour":
+            return local.strftime("%Y-%m-%dT%H:00")
+        case "day":
+            return local.date().isoformat()
+        case "week":
+            return (local.date() - timedelta(days=local.weekday())).isoformat()
+        case _:
+            return local.strftime("%Y-%m-01")
+
+
+def _bucket_range(start: datetime, end: datetime, unit: str, tz: tzinfo) -> list[str]:
+    """Every bucket key from *start* to *end* (local datetimes), in order, without duplicates."""
+    keys: list[str] = []
+    if unit == "hour":
+        # Align to the local hour (UTC alignment would be wrong for +05:30 zones),
+        # then step in UTC so a repeated or skipped hour at a DST change is handled.
+        cursor = start.astimezone(tz).replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        stop = end.astimezone(timezone.utc)
+        while cursor <= stop:
+            key = _bucket_key(cursor.astimezone(tz), unit)
+            if not keys or keys[-1] != key:
+                keys.append(key)
+            cursor += timedelta(hours=1)
+        return keys
+    day, last = start.date(), end.date()
+    if unit == "week":
+        day -= timedelta(days=day.weekday())
+    elif unit == "month":
+        day = day.replace(day=1)
+    while day <= last:
+        keys.append(day.isoformat())
+        if unit == "day":
+            day += timedelta(days=1)
+        elif unit == "week":
+            day += timedelta(days=7)
+        else:
+            day = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return keys
+
+
+def _empty_bucket() -> dict[str, Any]:
+    return {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cost_usd": None,
+        "priced_requests": 0,
+        "requests": 0,
+    }
