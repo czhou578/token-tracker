@@ -4,7 +4,8 @@ import json
 import socket
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -86,13 +87,28 @@ class UsageDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection, commit on success, and always close it.
+
+        A sqlite3 connection's own ``with`` block only commits; the connection
+        stays open until the cyclic garbage collector finds it.
+        """
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def init(self) -> None:
         with self.connect() as connection:
+            try:
+                # Persistent: readers and the collector's writes no longer block each other.
+                connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                pass  # another process holds a lock; the next start tries again
             connection.executescript(SCHEMA)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(usage_events)")}
             if "cost_usd" not in columns:
@@ -102,7 +118,11 @@ class UsageDatabase:
                 connection.execute("ALTER TABLE usage_events ADD COLUMN host TEXT")
             if "synced" not in columns:
                 connection.execute("ALTER TABLE usage_events ADD COLUMN synced INTEGER NOT NULL DEFAULT 0")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_host ON usage_events(host)")
+            # Covers hosts(), so it reads only the index; also serves host = ? filters.
+            connection.execute("DROP INDEX IF EXISTS idx_usage_events_host")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_events_host_totals ON usage_events(host, timestamp, total_tokens)"
+            )
             connection.execute("UPDATE usage_events SET host = ? WHERE host IS NULL", (self.hostname,))
         self._migrate_claude_duplicates()
 
@@ -305,6 +325,8 @@ class UsageDatabase:
         SQLite only knows UTC, so rows are first summed into 15-minute UTC
         slots (fine enough for every real timezone offset) and then mapped to
         local buckets with zoneinfo, which also handles daylight-saving changes.
+        The slots are cut from the text with substr, which is safe because
+        `_event_row` always stores UTC ``isoformat()`` timestamps.
         """
         window = filters.get("window")
         tz = resolve_tz(filters.get("tz"))
@@ -313,8 +335,8 @@ class UsageDatabase:
         with self.connect() as connection:
             slots = connection.execute(
                 f"""
-                SELECT strftime('%Y-%m-%dT%H:', timestamp)
-                         || printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER) / 15) * 15) AS slot,
+                SELECT substr(timestamp, 1, 14)
+                         || printf('%02d', (CAST(substr(timestamp, 15, 2) AS INTEGER) / 15) * 15) AS slot,
                        SUM(total_tokens) AS total_tokens,
                        SUM(prompt_tokens) AS prompt_tokens,
                        SUM(completion_tokens) AS completion_tokens,
@@ -332,7 +354,7 @@ class UsageDatabase:
         for slot in slots:
             if slot["slot"] is None:
                 continue
-            local = datetime.strptime(slot["slot"], "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).astimezone(tz)
+            local = datetime.fromisoformat(slot["slot"] + "+00:00").astimezone(tz)
             first_local = local if first_local is None or local < first_local else first_local
             bucket = buckets.setdefault(_bucket_key(local, unit), _empty_bucket())
             for column in ("total_tokens", "prompt_tokens", "completion_tokens", "priced_requests", "requests"):
@@ -408,6 +430,9 @@ class UsageDatabase:
         return {"database": str(self.path), "exists": self.path.exists()}
 
     def _grouped(self, expression: str, label: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        # GROUP BY 1 groups by the shown label, so NULL and a literal 'unknown'
+        # share one row. GROUP BY model would also let SQLite walk the whole
+        # model index in order and skip the timestamp index of the window.
         where, values = self._filters(filters)
         with self.connect() as connection:
             rows = connection.execute(
@@ -423,7 +448,7 @@ class UsageDatabase:
                     COUNT(DISTINCT thread_id) AS threads,
                     AVG(latency_ms) AS average_latency_ms
                 FROM usage_events {where}
-                GROUP BY {label}
+                GROUP BY 1
                 ORDER BY total_tokens DESC
                 LIMIT 200
                 """,

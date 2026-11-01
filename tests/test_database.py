@@ -372,3 +372,75 @@ def test_resolve_tz_falls_back_for_unknown_names() -> None:
     assert resolve_tz("Not/AZone") is not None
     assert resolve_tz("../../etc/passwd") is not None
     assert resolve_tz(None) is not None
+
+
+def test_series_slots_map_to_half_hour_offset_hours(tmp_path) -> None:
+    from zoneinfo import ZoneInfo
+
+    kolkata = ZoneInfo("Asia/Kolkata")
+    midnight = datetime.now(kolkata).replace(hour=0, minute=0, second=0, microsecond=0)
+    database = UsageDatabase(tmp_path / "usage.db")
+    database.insert_events([
+        # 04:50 local is 23:20 UTC: the 23:15 slot, 04:45 local.
+        UsageEvent(source_id="a", provider="claude", prompt_tokens=3,
+                   timestamp=midnight + timedelta(hours=4, minutes=50, seconds=59, microseconds=123000)),
+        # 05:14 local is 23:44 UTC: the 23:30 slot, 05:00 local.
+        UsageEvent(source_id="b", provider="claude", prompt_tokens=5,
+                   timestamp=midnight + timedelta(hours=5, minutes=14)),
+    ])
+
+    by_period = {row["period"]: row["total_tokens"] for row in database.series(window="today", tz="Asia/Kolkata")["rows"]}
+
+    day = midnight.strftime("%Y-%m-%d")
+    assert by_period[f"{day}T04:00"] == 3
+    assert by_period[f"{day}T05:00"] == 5
+
+
+def test_grouped_rows_merge_null_with_a_literal_unknown(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db")
+    now = datetime.now(timezone.utc)
+    database.insert_events([
+        UsageEvent(source_id="a", provider="claude", model=None, prompt_tokens=1, timestamp=now),
+        UsageEvent(source_id="b", provider="claude", model="unknown", prompt_tokens=2, timestamp=now),
+        UsageEvent(source_id="c", provider="claude", model="claude-opus-5-5", prompt_tokens=4, timestamp=now),
+    ])
+
+    models = {row["model"]: row["total_tokens"] for row in database.models(window="today")}
+
+    assert models == {"claude-opus-5-5": 4, "unknown": 3}
+
+
+def test_init_enables_wal_and_replaces_the_host_index(tmp_path) -> None:
+    path = tmp_path / "usage.db"
+    UsageDatabase(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("DROP INDEX idx_usage_events_host_totals")
+        connection.execute("CREATE INDEX idx_usage_events_host ON usage_events(host)")
+    connection.close()
+
+    UsageDatabase(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        indexes = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        plan = " ".join(row[-1] for row in connection.execute(
+            "EXPLAIN QUERY PLAN SELECT host, COUNT(*), SUM(total_tokens), MAX(timestamp) FROM usage_events GROUP BY host"
+        ))
+    connection.close()
+    assert "idx_usage_events_host" not in indexes
+    assert "COVERING INDEX idx_usage_events_host_totals" in plan
+
+
+def test_queries_close_their_connections(tmp_path) -> None:
+    import gc
+
+    gc.collect()
+    gc.disable()
+    try:
+        database = UsageDatabase(tmp_path / "usage.db")
+        database.stats()
+        database.hosts()
+        assert not [obj for obj in gc.get_objects() if isinstance(obj, sqlite3.Connection)]
+    finally:
+        gc.enable()

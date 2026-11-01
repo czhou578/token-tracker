@@ -58,7 +58,9 @@ app = create_app()
 
 def main() -> None:
     settings = get_settings()
-    uvicorn.run("tokentracker.api.main:app", host=settings.host, port=settings.port, log_level="warning")
+    # The app object, not "module:app": under `python -m` the string imports this
+    # module a second time and runs create_app() again.
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning")
 
 
 if __name__ == "__main__":
