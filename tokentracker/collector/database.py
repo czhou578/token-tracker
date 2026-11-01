@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS usage_events (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events(project);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_thread ON usage_events(thread_id);
@@ -50,6 +49,19 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+
+# Leads with timestamp for the window filter and holds every column the
+# aggregate queries read, so they scan this index and never touch the table,
+# whose rows also carry source_id and metadata_json (about 3x the bytes). It
+# replaces idx_usage_events_timestamp, so an insert still updates one index
+# page for it. Created in `init`, after the columns it lists exist.
+ROLLUP_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_usage_events_rollup ON usage_events (
+    timestamp, host, provider, model, project, thread_id,
+    total_tokens, prompt_tokens, completion_tokens, cache_read_tokens,
+    cache_write_tokens, reasoning_tokens, cost_usd, latency_ms
+)
 """
 
 # One-time migration marker: Claude rows ingested before parse_claude_jsonl
@@ -154,6 +166,8 @@ class UsageDatabase:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_events_host_totals ON usage_events(host, timestamp, total_tokens)"
             )
+            connection.execute(ROLLUP_INDEX)  # first, so the window filter always has an index
+            connection.execute("DROP INDEX IF EXISTS idx_usage_events_timestamp")
             connection.execute("UPDATE usage_events SET host = ? WHERE host IS NULL", (self.hostname,))
         self._migrate_claude_duplicates()
 
@@ -302,7 +316,7 @@ class UsageDatabase:
                        SUM(total_tokens) AS total_tokens, MAX(timestamp) AS last_timestamp
                 FROM usage_events
                 WHERE cost_usd IS NULL
-                GROUP BY model
+                GROUP BY 1
                 ORDER BY total_tokens DESC
                 """
             ).fetchall()
