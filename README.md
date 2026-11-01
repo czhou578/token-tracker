@@ -210,6 +210,20 @@ after being offline.
    Funnel works even when the laptop is on a different tailnet, because the laptop only makes an outbound
    HTTPS request.
 
+### Phone
+
+With Tailscale on the phone, the dashboard is at `https://<machine>.<tailnet>.ts.net:8443`. In Safari, use
+Share, then "Add to Home Screen", for an app icon.
+
+For a home-screen widget, use the [Scriptable](https://scriptable.app) app with
+[`extras/scriptable-widget.js`](extras/scriptable-widget.js). The script calls `/api/stats` for today and the
+last seven days, draws cost, tokens and requests, opens the dashboard when tapped, and keeps the last numbers
+when the phone is off the tailnet. Edit `BASE_URL` at the top if your address differs, and `HOST` to pin one
+machine. iOS decides when widgets reload: every few minutes while you use the phone, 15 to 60 minutes
+otherwise, and rarely in Low Power Mode. The footer shows the age of the numbers. For an on-demand refresh,
+add a second widget with the Parameter field set to `refresh` and "When Interacting" set to "Run Script";
+tapping it re-fetches at once.
+
 ### On the second machine
 
 ```bash
