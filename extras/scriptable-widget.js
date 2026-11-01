@@ -11,6 +11,14 @@
 //   3. Edit BASE_URL below if your dashboard address differs.
 //   4. Long-press the home screen, add a Scriptable widget (small or medium),
 //      tap it and choose the "Token Tracker" script.
+//
+// Refresh: iOS decides when widgets reload. The script asks for a reload every
+// REFRESH_MINUTES, which iOS honours only while the phone is awake and has
+// budget (in practice every few minutes in use, 15 to 60 minutes otherwise).
+// The footer shows how old the numbers are. To refresh on demand, add a second
+// widget whose Parameter field is "refresh" and set "When Interacting" to
+// "Run Script": tapping that widget re-fetches immediately instead of opening
+// the dashboard.
 
 const BASE_URL = "https://spark-44de.tailfbc629.ts.net:8443";
 const HOST = ""; // "" = all machines, or e.g. "spark-44de" / "work-laptop"
@@ -21,7 +29,8 @@ const TIME_ZONE = (() => {
     return "";
   }
 })();
-const REFRESH_MINUTES = 15;
+const REFRESH_MINUTES = 5; // earliest next reload; Apple suggests no less than 5
+const TAP_REFRESHES = (args.widgetParameter || "").trim().toLowerCase() === "refresh";
 
 const fm = FileManager.local();
 const cachePath = fm.joinPath(fm.documentsDirectory(), "tokentracker-widget.json");
@@ -89,7 +98,9 @@ function addBlock(stack, label, stats, large) {
 function buildWidget(data) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color("#1a1d21");
-  widget.url = BASE_URL;
+  if (!TAP_REFRESHES) {
+    widget.url = BASE_URL; // a tap opens the dashboard (via a brief hop through Scriptable, an iOS rule)
+  }
   widget.setPadding(14, 14, 12, 14);
   widget.refreshAfterDate = new Date(Date.now() + REFRESH_MINUTES * 60 * 1000);
 
@@ -117,7 +128,7 @@ function buildWidget(data) {
 
   widget.addSpacer();
   const footer = data.live
-    ? `updated ${age(data.fetchedAt)}`
+    ? `updated ${age(data.fetchedAt)}${TAP_REFRESHES ? " · tap to refresh" : ""}`
     : data.fetchedAt
       ? `offline · last ${age(data.fetchedAt)}`
       : "offline · turn on Tailscale";
