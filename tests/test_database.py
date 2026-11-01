@@ -444,3 +444,44 @@ def test_queries_close_their_connections(tmp_path) -> None:
         assert not [obj for obj in gc.get_objects() if isinstance(obj, sqlite3.Connection)]
     finally:
         gc.enable()
+
+
+def test_persistent_database_reuses_one_connection_without_blocking_checkpoints(tmp_path) -> None:
+    path = tmp_path / "usage.db"
+    database = UsageDatabase(path, persistent=True)
+    event = UsageEvent(source_id="a", provider="claude", prompt_tokens=3, timestamp=datetime.now(timezone.utc))
+
+    with database.connect() as first:
+        assert first.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+    assert database.insert_events([event]) == 1
+    database.stats()
+    database.hosts()
+    with database.connect() as again:
+        assert again is first
+    assert not first.in_transaction
+
+    # Committed and visible to other processes, and no open read keeps the WAL from a full checkpoint.
+    with sqlite3.connect(path) as other:
+        assert other.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
+        busy, _, _ = other.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert busy == 0
+    other.close()
+
+    database.close()
+    with database.connect() as reopened:
+        assert reopened is not first
+    database.close()
+
+
+def test_persistent_database_reopens_after_a_sqlite_error(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", persistent=True)
+    with database.connect() as before:
+        pass
+    try:
+        with database.connect() as connection:
+            connection.execute("SELECT * FROM no_such_table")
+    except sqlite3.OperationalError:
+        pass
+    with database.connect() as after:
+        assert after is not before
+    database.close()

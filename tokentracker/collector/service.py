@@ -54,7 +54,7 @@ class Collector:
         self.cline_db = cline_db or self.settings.cline_db
         self.cline_task_history = cline_task_history or self.settings.cline_task_history
         self.hermes_db = hermes_db or self.settings.hermes_db
-        self.database = UsageDatabase(self.settings.db_path, hostname=self.settings.hostname)
+        self.database = UsageDatabase(self.settings.db_path, hostname=self.settings.hostname, persistent=True)
         self.forwarder = Forwarder(self.settings, self.database)
         self.pricing_file = self.settings.pricing_file
         self.pricing = Pricing.load(self.pricing_file)
@@ -169,6 +169,7 @@ class Collector:
                     log.debug("recorded %d new usage events", inserted)
             first = False
             time.sleep(self.settings.poll_seconds)
+        self.database.close()  # checkpoints the WAL into the database file
         log.info("collector stopped")
 
 

@@ -81,34 +81,64 @@ INSERT_COLUMNS = (
 
 
 class UsageDatabase:
-    def __init__(self, path: Path, hostname: str | None = None):
+    def __init__(self, path: Path, hostname: str | None = None, persistent: bool = False):
+        """*persistent* keeps one connection for the life of the object (single thread only).
+
+        The last connection to close checkpoints the WAL into the database
+        file, so a long-lived writer that closed after every commit would write
+        each page twice and fsync about five times per insert. The collector
+        keeps its connection open; the dashboard's threads open their own.
+        """
         self.path = path
         self.hostname = hostname or socket.gethostname()
+        self._persistent = persistent
+        self._connection: sqlite3.Connection | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        """Open a connection, commit on success, and always close it.
+        """Yield a connection and commit on success; close it unless persistent.
 
         A sqlite3 connection's own ``with`` block only commits; the connection
         stays open until the cyclic garbage collector finds it.
         """
+        if not self._persistent:
+            connection = self._open()
+            try:
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
+            return
+        if self._connection is None:
+            connection = self._open()
+            if _enable_wal(connection):
+                # Commits skip the fsync. A power loss can drop the last few; the
+                # collector's first scan after a restart parses them again.
+                connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection = connection
+        try:
+            with self._connection:
+                yield self._connection
+        except sqlite3.Error:
+            self.close()  # reopen on the next call rather than reuse a broken handle
+            raise
+
+    def close(self) -> None:
+        """Close the persistent connection, if any; the next call reopens it."""
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def _open(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        return connection
 
     def init(self) -> None:
         with self.connect() as connection:
-            try:
-                # Persistent: readers and the collector's writes no longer block each other.
-                connection.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError:
-                pass  # another process holds a lock; the next start tries again
+            _enable_wal(connection)
             connection.executescript(SCHEMA)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(usage_events)")}
             if "cost_usd" not in columns:
@@ -495,6 +525,17 @@ WHERE excluded.total_tokens != usage_events.total_tokens
    OR excluded.metadata_json != usage_events.metadata_json
    OR excluded.cost_usd IS NOT usage_events.cost_usd
 """
+
+
+def _enable_wal(connection: sqlite3.Connection) -> bool:
+    """Switch the file to WAL (it stays set), so readers and the writer never block each other.
+
+    Returns False when another process holds a lock; the next start tries again.
+    """
+    try:
+        return connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    except sqlite3.OperationalError:
+        return False
 
 
 def _event_row(event: UsageEvent) -> tuple[Any, ...]:
