@@ -73,3 +73,12 @@ def test_series_endpoint_uses_the_tz_parameter(client) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["tz"] == "Asia/Kolkata" and body["unit"] == "hour" and len(body["rows"]) == 24
+
+
+def test_dashboard_files_are_revalidated(client) -> None:
+    http, _ = client
+    for path in ("/", "/assets/app.js", "/assets/styles.css"):
+        response = http.get(path)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+    assert "cache-control" not in http.get("/api/health").headers

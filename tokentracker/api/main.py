@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib.resources import files
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -20,6 +20,15 @@ def create_app() -> FastAPI:
 
     static_dir = files("tokentracker.dashboard") / "static"
     app.mount("/assets", StaticFiles(directory=str(static_dir)), name="assets")
+
+    @app.middleware("http")
+    async def revalidate_dashboard_files(request: Request, call_next):
+        # Without this, browsers may reuse an old app.js or styles.css after an
+        # upgrade. "no-cache" still allows a cheap 304 when nothing changed.
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/")
     def index() -> FileResponse:

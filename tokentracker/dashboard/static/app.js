@@ -48,10 +48,53 @@ function money(value) {
   return value == null ? "—" : usd.format(value);
 }
 
+// The time window and machine are button groups, not <select> elements: a native
+// dropdown is drawn by the browser outside the page and closes immediately in some
+// embedded browsers (for example editor previews). Choices are remembered per browser.
+const WINDOWS = [...ids.window.querySelectorAll("button[data-value]")].map((button) => button.dataset.value);
+const state = {
+  window: readPref("window", "7d", (value) => WINDOWS.includes(value)),
+  host: readPref("host", "", () => true),
+};
+
+function readPref(key, fallback, valid) {
+  try {
+    const value = localStorage.getItem(`tokentracker.${key}`);
+    return value !== null && valid(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function savePref(key, value) {
+  try {
+    localStorage.setItem(`tokentracker.${key}`, value);
+  } catch {
+    // Storage can be unavailable (private window, blocked site data); the choice just isn't remembered.
+  }
+}
+
+function markPressed(group, value) {
+  group.querySelectorAll("button[data-value]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.value === value));
+  });
+}
+
+function onGroupClick(group, key) {
+  group.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-value]");
+    if (!button || button.dataset.value === state[key]) return;
+    state[key] = button.dataset.value;
+    savePref(key, state[key]);
+    markPressed(group, state[key]);
+    load().catch(showError);
+  });
+}
+
 async function get(path) {
   const params = new URLSearchParams();
-  if (ids.window.value) params.set("window", ids.window.value);
-  if (ids.host.value) params.set("host", ids.host.value);
+  if (state.window) params.set("window", state.window);
+  if (state.host) params.set("host", state.host);
   if (TIME_ZONE) params.set("tz", TIME_ZONE);
   const query = params.toString();
   const response = await fetch(`/api/${path}${query ? `?${query}` : ""}`);
@@ -62,20 +105,29 @@ async function get(path) {
 async function loadHosts() {
   const response = await fetch("/api/hosts");
   if (!response.ok) return;
-  const hosts = (await response.json()).filter((row) => row.host);
-  const selected = ids.host.value;
-  ids.host.innerHTML = '<option value="">All machines</option>';
-  hosts.forEach((row) => {
-    const option = document.createElement("option");
-    option.value = row.host;
-    option.textContent = row.host;
-    ids.host.appendChild(option);
-  });
-  ids.host.value = hosts.some((row) => row.host === selected) ? selected : "";
+  const hosts = (await response.json()).map((row) => row.host).filter(Boolean).sort();
+  if (!hosts.includes(state.host) && state.host !== "") {
+    state.host = "";
+    savePref("host", "");
+  }
+  const signature = hosts.join("\n");
+  if (ids.host.dataset.hosts !== signature) {
+    // Rebuild only when the set of machines changes, so the controls stay still.
+    ids.host.dataset.hosts = signature;
+    ids.host.innerHTML = ["", ...hosts]
+      .map((host) => `<button type="button" data-value="${escapeHtml(host)}">${host ? escapeHtml(host) : "All machines"}</button>`)
+      .join("");
+  }
+  markPressed(ids.host, state.host);
   ids.host.hidden = hosts.length < 2;
 }
 
+let loadSequence = 0;
+
 async function load() {
+  // Quick clicks start overlapping loads; only the newest one may render, so a
+  // slow earlier response can never overwrite the window that is now selected.
+  const sequence = ++loadSequence;
   await loadHosts();
   const [stats, series, models, projects] = await Promise.all([
     get("stats"),
@@ -83,6 +135,7 @@ async function load() {
     get("models"),
     get("projects"),
   ]);
+  if (sequence !== loadSequence) return;
   renderStats(stats);
   renderSeries(series);
   renderBars(ids.modelsChart, models, "model");
@@ -218,14 +271,18 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-ids.window.addEventListener("change", load);
-ids.host.addEventListener("change", load);
-ids.refresh.addEventListener("click", load);
+function showError(error) {
+  if (!error) return;
+  ids.dailyChart.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+}
+
+markPressed(ids.window, state.window);
+onGroupClick(ids.window, "window");
+onGroupClick(ids.host, "host");
+ids.refresh.addEventListener("click", () => load().catch(showError));
 ids.costHelp.addEventListener("click", () => openCostHelp().catch(() => {}));
 ids.costClose.addEventListener("click", () => ids.costDialog.close());
 ids.costDialog.addEventListener("click", (event) => {
   if (event.target === ids.costDialog) ids.costDialog.close();
 });
-load().catch((error) => {
-  ids.dailyChart.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
-});
+load().catch(showError);

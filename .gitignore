@@ -1,20 +1,35 @@
-/# Byte-compiled / optimized / compiled files
+# Byte-compiled / optimized / compiled files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 
-# Virtual environment
+# Virtual environments
 .venv/
+venv/
+env/
 
 # Package build artifacts
-tokentracker.egg-info/
+*.egg-info/
 build/
 dist/
 
-# Testing cache
+# Test and tool caches
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
 .coverage*
+htmlcov/
+
+# Local tracker data, in case a copy lands in the project folder
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak-*
+/ingest_token
+/config.json
 
 # IDE
 .vscode/

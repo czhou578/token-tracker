@@ -12,6 +12,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -28,6 +29,7 @@ body {
 
 .topbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
@@ -46,7 +48,43 @@ h1, h2 { margin: 0; letter-spacing: 0; }
 h1 { font-size: clamp(30px, 5vw, 54px); line-height: 1; }
 h2 { font-size: 16px; }
 
-.controls { display: flex; gap: 10px; }
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto; /* stays right-aligned when it wraps under the title */
+  min-width: 0;
+}
+
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.segmented button {
+  min-height: 38px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.segmented button + button { border-left: 1px solid var(--line); }
+.segmented button:hover { color: var(--text); }
+.segmented button[aria-pressed="true"] {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.segmented button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 select, button {
   min-height: 40px;
@@ -79,24 +117,38 @@ button {
 }
 
 .cards article { padding: 16px; min-width: 0; }
-.cards span { color: var(--muted); display: block; margin-bottom: 8px; }
+/* Every card label is a fixed-height row, so the values below line up across
+   cards even when a label holds the "?" button. */
+.cards article > span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* Values are formatted compactly in app.js (count/money); the wrap rules below are a last resort. */
-.cards strong { display: block; font-size: clamp(20px, 3vw, 30px); line-height: 1.1; overflow-wrap: anywhere; }
+.cards strong { display: block; font-size: clamp(20px, 3vw, 30px); line-height: 1.1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .cards small { display: block; color: var(--muted); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
 .row strong { white-space: nowrap; text-align: right; }
 .row strong small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
 
-.card-title { display: flex; align-items: center; gap: 8px; }
 .help {
   flex: none;
   width: 20px;
   height: 20px;
+  min-height: 0;
   padding: 0;
   border-radius: 50%;
   border: 1px solid var(--line);
   background: var(--panel-2);
   color: var(--muted);
-  font: 700 12px/1 inherit;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
   line-height: 18px;
   text-align: center;
 }
@@ -225,8 +277,9 @@ button {
 
 @media (max-width: 780px) {
   .topbar { align-items: stretch; flex-direction: column; }
-  .controls { width: 100%; }
-  select, button { flex: 1; }
+  .controls { width: 100%; margin-left: 0; justify-content: stretch; }
+  .controls > * { flex: 1 1 100%; }
+  .segmented button { flex: 1 1 auto; min-width: 0; padding: 0 6px; }
   .cards, .grid { grid-template-columns: 1fr; }
   .wide { grid-column: auto; }
 }
