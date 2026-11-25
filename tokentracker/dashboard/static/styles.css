@@ -197,8 +197,9 @@ button {
 
 .grid {
   display: grid;
-  /* Three panels follow the chart: as many columns as fit, so a wide screen shows them in one row. */
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  /* Three panels follow the chart, one column each. A fixed count, not auto-fit: the chart spans every
+     column, so auto-fit keeps a fourth, empty column on a wide screen. */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -276,11 +277,17 @@ button {
   border-top: 1px solid var(--line);
 }
 
+/* Too narrow for three panels: two columns, and the last panel takes the full row. */
+@media (max-width: 1020px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid > .panel:last-child { grid-column: 1 / -1; }
+}
+
 @media (max-width: 780px) {
   .topbar { align-items: stretch; flex-direction: column; }
   .controls { width: 100%; margin-left: 0; justify-content: stretch; }
   .controls > * { flex: 1 1 100%; }
   .segmented button { flex: 1 1 auto; min-width: 0; padding: 0 6px; }
   .cards, .grid { grid-template-columns: 1fr; }
-  .wide { grid-column: auto; }
+  .wide, .grid > .panel:last-child { grid-column: auto; }
 }
