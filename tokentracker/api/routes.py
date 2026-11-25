@@ -55,6 +55,7 @@ _ROUTE_METHODS = {
     "daily",
     "series",
     "models",
+    "providers",
     "projects",
     "threads",
     "timeline",

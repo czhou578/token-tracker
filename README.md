@@ -173,6 +173,17 @@ tracker uninstall-service
 
 The dashboard API is started on demand by `tracker dashboard`.
 
+## Other sources
+
+A tool that calls a model server directly leaves no transcript for the collector. Such a tool can push its own
+events to `POST /api/events` on the same machine, with the token of `tracker ingest-token` (see
+[Second machine](#second-machine)). Give the events their own `provider` label. The dashboard shows the total of
+each label in the "Providers" panel, and `/api/providers` gives the same rows. Token Tracker keeps one row for each
+`source_id` and host, so a second push of the same events adds nothing.
+
+For example, [model-benchmarks](https://github.com/czhou578/model-benchmarks) pushes one event for each model turn
+of its agent benchmark, with `provider = "agent-eval"`.
+
 ## Second machine
 
 Every event carries the name of the machine it came from, and the dashboard gets a machine selector when

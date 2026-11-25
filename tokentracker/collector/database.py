@@ -430,6 +430,10 @@ class UsageDatabase:
     def models(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("COALESCE(model, 'unknown')", "model", filters)
 
+    def providers(self, **filters: Any) -> list[dict[str, Any]]:
+        """Totals for each tool that made the requests (`claude`, `cline`, `hermes`, or the label of a pushed source)."""
+        return self._grouped("provider", "provider", filters)
+
     def projects(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("COALESCE(project, 'unknown')", "project", filters)
 
