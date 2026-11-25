@@ -110,6 +110,23 @@ def test_ingest_prices_events_with_this_machines_rates(client) -> None:
     assert abs(cost - 10 * 4 / 1_000_000) < 1e-12  # claude-opus-5-5 input rate, not the sender's 999
 
 
+def test_providers_endpoint_shows_the_label_of_a_pushed_source(client) -> None:
+    http, home = client
+    (home / "ingest_token").write_text("secret\n")
+    pushed = {"source_id": "agent-eval:run/1:0", "provider": "agent-eval", "model": "local-model",
+              "prompt_tokens": 90, "completion_tokens": 10, "timestamp": "2026-10-31T10:00:00Z"}
+    for _ in range(2):  # a second push of the same events adds nothing
+        response = http.post("/api/events", json={"host": "laptop", "events": [EVENT, pushed]}, headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200
+
+    rows = {row["provider"]: row for row in http.get("/api/providers").json()}
+    assert set(rows) == {"claude", "agent-eval"}
+    assert rows["agent-eval"]["total_tokens"] == 100 and rows["agent-eval"]["requests"] == 1
+    assert rows["agent-eval"]["cost_usd"] is None  # a local model has no rate card
+    assert http.get("/api/providers", params={"provider": "claude"}).json()[0]["total_tokens"] == 10
+    assert 'id="providersChart"' in http.get("/").text
+
+
 def test_ingest_rejects_an_event_with_a_bad_field(client) -> None:
     http, home = client
     (home / "ingest_token").write_text("secret\n")

@@ -9,6 +9,7 @@ const ids = {
   dailyRange: document.querySelector("#dailyRange"),
   modelsChart: document.querySelector("#modelsChart"),
   projectsChart: document.querySelector("#projectsChart"),
+  providersChart: document.querySelector("#providersChart"),
   window: document.querySelector("#window"),
   host: document.querySelector("#host"),
   refresh: document.querySelector("#refresh"),
@@ -129,17 +130,19 @@ async function load() {
   // slow earlier response can never overwrite the window that is now selected.
   const sequence = ++loadSequence;
   await loadHosts();
-  const [stats, series, models, projects] = await Promise.all([
+  const [stats, series, models, projects, providers] = await Promise.all([
     get("stats"),
     get("series"),
     get("models"),
     get("projects"),
+    get("providers"),
   ]);
   if (sequence !== loadSequence) return;
   renderStats(stats);
   renderSeries(series);
   renderBars(ids.modelsChart, models, "model");
   renderBars(ids.projectsChart, projects, "project");
+  renderBars(ids.providersChart, providers, "provider");
 }
 
 function renderStats(stats) {
