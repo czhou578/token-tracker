@@ -416,9 +416,10 @@ class UsageDatabase:
 
         A chat is a thread and a bot is a provider, so both come from
         `usage_events`. `bots_total` counts the providers of all time and
-        `activity_since` is the time of the oldest activity row; both ignore
-        every filter except the machine. The dashboard shows "N of M" bots and
-        the date from which replies, tool calls and scheduled runs are counted.
+        `activity_since` gives the time of the oldest activity row of each
+        provider; both ignore every filter except the machine. The dashboard
+        shows "N of M" bots and the date from which the replies, tool calls
+        and scheduled runs of each provider are counted.
         """
         where, values = self._filters(filters)
         machine, machine_values = self._filters({"host": filters.get("host")})
@@ -444,9 +445,9 @@ class UsageDatabase:
                 """,
                 values,
             ).fetchone()
-            since = connection.execute(
-                f"SELECT MIN(timestamp) FROM activity_events {machine}", machine_values
-            ).fetchone()[0]
+            since = dict(connection.execute(
+                f"SELECT provider, MIN(timestamp) FROM activity_events {machine} GROUP BY provider", machine_values
+            ).fetchall())
         return _dict(usage) | {"bots_total": bots_total} | _dict(activity) | {"activity_since": since}
 
     def daily(self, **filters: Any) -> list[dict[str, Any]]:

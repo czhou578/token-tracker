@@ -141,7 +141,7 @@ def test_highlights_endpoint_counts_chats_and_bots(client) -> None:
     assert http.get("/api/highlights").json() == {
         "chats": 0, "bots_used": 0, "bots_total": 0,
         "replies": 0, "tool_calls": 0, "tools_used": 0, "scheduled_runs": 0,
-        "activity_since": None,
+        "activity_since": {},
     }
     events = [EVENT | {"thread_id": "t1"}, EVENT | {"source_id": "s:2", "thread_id": "t2", "provider": "hermes"}]
     response = http.post("/api/events", json={"host": "laptop", "events": events}, headers={"Authorization": "Bearer secret"})
@@ -151,3 +151,13 @@ def test_highlights_endpoint_counts_chats_and_bots(client) -> None:
     assert (body["chats"], body["bots_used"], body["bots_total"]) == (2, 2, 2)
     today = http.get("/api/highlights", params={"window": "today", "host": "laptop"}).json()
     assert (today["chats"], today["bots_used"], today["bots_total"]) == (0, 0, 2)  # the events are from 2026-10-31
+
+
+def test_dashboard_has_the_activity_tiles(client) -> None:
+    http, _ = client
+    page = http.get("/").text
+    for tile in ("chats", "replies", "bots", "toolCalls", "toolsUsed", "scheduledRuns"):
+        assert f'id="{tile}"' in page
+    assert 'id="threads"' not in page  # the Threads card is now the Chats tile
+    script = http.get("/assets/app.js").text
+    assert 'get("highlights")' in script and "#threads" not in script
