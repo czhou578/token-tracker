@@ -14,6 +14,7 @@ from tokentracker.collector.parser import (
     parse_cline_sqlite,
     parse_cline_task_history,
     parse_gateway_record,
+    parse_hermes_activity,
     parse_hermes_state_db,
     session_project,
 )
@@ -523,3 +524,74 @@ def test_transcript_activity_holds_only_the_last_read(tmp_path) -> None:
     assert reader.read() == []
     assert [event.source_id for event in reader.activity] == ["tool:toolu_1"]
     assert reader.read() == [] and reader.activity == []
+
+
+def _hermes_chat_db(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, started_at REAL, cwd TEXT, git_repo_root TEXT)")
+    connection.execute(
+        """CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT,
+            tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL, finish_reason TEXT)"""
+    )
+    for session, source in (("chat", "discord"), ("cron_1", "cron"), ("cron_2", "cron"), ("sub", "subagent")):
+        connection.execute("INSERT INTO sessions VALUES (?, ?, 'deepseek-v4-flash', 1793000000.0, '/home/u/blog', NULL)", (session, source))
+    return connection
+
+
+def _hermes_message(connection, session, role, timestamp, *, content=None, call_id=None, tool=None, calls=None, finish=None) -> None:
+    connection.execute(
+        "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp, finish_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (session, role, content, call_id, calls, tool, timestamp, finish),
+    )
+    connection.commit()
+
+
+def test_parse_hermes_activity_counts_each_action_once(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    connection = _hermes_chat_db(path)
+    add = lambda *args, **fields: _hermes_message(connection, *args, **fields)  # noqa: E731
+    add("chat", "user", 1793000001.0, content="hi")
+    add("chat", "assistant", 1793000002.0, calls="[{}]", finish="tool_calls")
+    add("chat", "tool", 1793000003.0, call_id="call_1", tool="terminal")
+    add("chat", "assistant", 1793000004.0, content="Let me verify.", finish="verification_required")
+    add("chat", "assistant", 1793000005.0, content="Done.", finish="stop")
+    # A compaction writes a summary, then the kept rows again with new ids and times.
+    add("chat", "assistant", 1793000090.0, content="[CONTEXT COMPACTION] summary")
+    add("chat", "tool", 1793000091.0, call_id="call_1", tool="terminal")
+    add("chat", "assistant", 1793000092.0, content="Done.", finish="stop")
+    add("cron_1", "tool", 1793000100.0, call_id="call_2", tool="web_search")
+    add("cron_1", "assistant", 1793000101.0, content="Report sent.", finish="stop")
+    add("sub", "tool", 1793000200.0, call_id="call_3", tool="terminal")
+    add("sub", "assistant", 1793000201.0, content="Result for the parent.", finish="stop")
+    add("cron_2", "user", 1793000250.0, content="The schedule fired, the model server did not answer.")
+
+    events, newest = parse_hermes_activity(path)
+
+    assert newest == 13
+    found = {event.source_id: event for event in reversed(events)}  # the first row of a key is the one stored
+    kinds = sorted((event.kind, event.thread_id, event.name) for event in found.values())
+    assert kinds == [
+        ("reply", "chat", None), ("reply", "cron_1", None),
+        ("scheduled_run", "cron_1", None), ("scheduled_run", "cron_2", None),
+        ("tool_call", "chat", "terminal"), ("tool_call", "cron_1", "web_search"), ("tool_call", "sub", "terminal"),
+    ]
+    call = found["hermes:tool:chat:call_1"]
+    assert (call.provider, call.project, call.model) == ("hermes", "blog", "deepseek-v4-flash")
+    assert call.timestamp == datetime.fromtimestamp(1793000003.0, tz=timezone.utc)  # not the time of the copy
+    assert found["hermes:run:cron_1"].timestamp == datetime.fromtimestamp(1793000000.0, tz=timezone.utc)
+
+    assert parse_hermes_activity(path, after=newest) == ([], newest)
+    add("cron_1", "tool", 1793000300.0, call_id="call_4", tool="read_file")
+    later, newest = parse_hermes_activity(path, after=newest)
+    assert [event.source_id for event in later] == ["hermes:run:cron_1", "hermes:tool:cron_1:call_4"] and newest == 14
+    # A cursor beyond the newest row means the file was replaced: start over.
+    again = {event.source_id for event in parse_hermes_activity(path, after=500)[0]}
+    assert again == set(found) | {"hermes:tool:cron_1:call_4"}
+    connection.close()
+
+
+def test_parse_hermes_activity_needs_the_messages_table(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    sqlite3.connect(path).execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT)").connection.close()
+    assert parse_hermes_activity(path, after=7) == ([], 0)
+    assert parse_hermes_activity(tmp_path / "missing.db", after=7) == ([], 0)

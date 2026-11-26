@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import sqlite3
@@ -540,14 +541,7 @@ def _hermes_record(row: sqlite3.Row) -> UsageEvent | None:
     if total_tokens == 0:
         return None
 
-    started = row["started_at"]
-    if isinstance(started, (int, float)) and started:
-        try:
-            timestamp = datetime.fromtimestamp(started, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            timestamp = datetime.now(timezone.utc)
-    else:
-        timestamp = _parse_timestamp(started)
+    timestamp = _from_epoch_seconds(row["started_at"])
 
     thread_id = str(row["id"])
     model = str(row["model"] or "unknown")
@@ -578,6 +572,99 @@ def _hermes_record(row: sqlite3.Row) -> UsageEvent | None:
         total_tokens=total_tokens,
         metadata_json=json.dumps(metadata),
     )
+
+
+HERMES_MESSAGE_COLUMNS = frozenset(
+    {"id", "session_id", "role", "tool_name", "tool_call_id", "tool_calls", "finish_reason", "timestamp", "content"}
+)
+HERMES_SESSION_COLUMNS = frozenset({"id", "source", "model", "started_at", "cwd", "git_repo_root"})
+_HERMES_REPLY = "m.role = 'assistant' AND m.tool_calls IS NULL AND m.finish_reason IS 'stop'"
+HERMES_ACTIVITY_SQL = f"""
+SELECT m.id, m.session_id, m.role, m.tool_name, m.tool_call_id, m.timestamp,
+       ({_HERMES_REPLY}) AS is_reply,
+       CASE WHEN {_HERMES_REPLY} THEN m.content END AS content,
+       s.source, s.model, s.started_at, s.cwd, s.git_repo_root
+FROM messages m JOIN sessions s ON s.id = m.session_id
+WHERE m.id > ? AND (m.role = 'tool' OR s.source = 'cron' OR ({_HERMES_REPLY}))
+ORDER BY m.id
+"""
+
+
+def parse_hermes_activity(path: Path, after: int = 0) -> tuple[list[ActivityEvent], int]:
+    """Return the Hermes activity of the `messages` rows with an id above *after*, and the highest id read.
+
+    - A tool call is a row with role `tool`. When Hermes compacts a session it
+      writes some rows again, with a new id and a new time, so the key is the
+      session and the `tool_call_id`.
+    - A reply is an assistant row without tool calls and with finish reason
+      `stop`. Other finish reasons are steps of a turn, and a row without one
+      is a compaction summary. The key holds a hash of the text, because a
+      compaction writes replies again too. A subagent session answers the
+      model, not the user, so it has no replies.
+    - A scheduled run is a session with source `cron`. It is reported with the
+      first row read from that session (the prompt of the schedule), at the
+      start time of the session.
+
+    When the newest row has an id below *after*, the file was replaced and the
+    read starts over from the first row (the database ignores rows it already
+    has). When there is no usable `messages` table, the result is empty and
+    the id is 0.
+    """
+    if not path.is_file():
+        return [], 0
+    events: list[ActivityEvent] = []
+    newest = after
+    runs: set[str] = set()
+    connection = sqlite3.connect(str(path))
+    connection.row_factory = sqlite3.Row
+    try:
+        messages = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+        sessions = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+        if not HERMES_MESSAGE_COLUMNS <= messages or not HERMES_SESSION_COLUMNS <= sessions:
+            return [], 0
+        if (connection.execute("SELECT MAX(id) FROM messages").fetchone()[0] or 0) < after:
+            after = newest = 0
+        for row in connection.execute(HERMES_ACTIVITY_SQL, (after,)):
+            newest = row["id"]
+            session = str(row["session_id"])
+            common = {
+                "thread_id": session,
+                "project": _project_from_cwd(row["git_repo_root"] or row["cwd"]),
+                "provider": HERMES_PROVIDER,
+                "model": str(row["model"] or "unknown"),
+            }
+            if row["source"] == "cron" and session not in runs:
+                runs.add(session)
+                events.append(ActivityEvent(
+                    source_id=f"hermes:run:{session}", kind="scheduled_run",
+                    timestamp=_from_epoch_seconds(row["started_at"]), **common,
+                ))
+            timestamp = _from_epoch_seconds(row["timestamp"])
+            if row["role"] == "tool":
+                call_id = row["tool_call_id"] or row["id"]
+                events.append(ActivityEvent(
+                    source_id=f"hermes:tool:{session}:{call_id}", kind="tool_call",
+                    name=str(row["tool_name"] or "unknown"), timestamp=timestamp, **common,
+                ))
+            elif row["is_reply"] and row["source"] != "subagent":
+                digest = hashlib.sha256(str(row["content"] or "").encode("utf-8")).hexdigest()[:16]
+                events.append(ActivityEvent(
+                    source_id=f"hermes:reply:{session}:{digest}", kind="reply", timestamp=timestamp, **common,
+                ))
+    except sqlite3.Error:
+        return [], after  # locked or half-written: read the same rows on the next change
+    finally:
+        connection.close()
+    return events, newest
+
+
+def _from_epoch_seconds(value: object) -> datetime:
+    if isinstance(value, (int, float)) and value:
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return datetime.now(timezone.utc)
+    return _parse_timestamp(value)
 
 
 def _extract_cline_usage(payload: dict) -> object:
