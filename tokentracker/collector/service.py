@@ -4,18 +4,23 @@ import logging
 import signal
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tokentracker.collector.config import get_settings
-from tokentracker.collector.database import UsageDatabase
+from tokentracker.collector.database import CLAUDE_DEDUPE_WINDOW_SECONDS, UsageDatabase
 from tokentracker.collector.parser import (
+    GATEWAY_SOURCE_PREFIX,
     ClaudeTranscript,
+    GatewayLog,
     parse_cline_sqlite,
     parse_cline_task_history,
     parse_hermes_state_db,
+    session_project,
 )
 from tokentracker.collector.forwarder import Forwarder
 from tokentracker.collector.memory import release_memory
+from tokentracker.collector.models import UsageEvent
 from tokentracker.collector.pricing import Pricing
 
 log = logging.getLogger("tokentracker.collector")
@@ -24,6 +29,12 @@ log = logging.getLogger("tokentracker.collector")
 # the second the `Pricing.fingerprint` that stored costs were last computed with.
 TRANSCRIPTS_META_KEY = "collector_transcripts_v1"
 PRICING_META_KEY = "pricing_fingerprint"
+# The read position in the gateway usage log: the start of the first line not yet stored or dropped.
+GATEWAY_META_KEY = "collector_gateway_log_v1"
+# The gateway log holds every response of a local model. The transcripts hold the main turns, written within seconds
+# of the response. A gateway line waits this long before it is compared with the stored transcript rows, so a main
+# turn counts once, from its transcript, and only the side requests count from the log.
+GATEWAY_GRACE_SECONDS = 60
 
 # (mtime_ns, size) of a source file, folded with its SQLite WAL file when one exists.
 Signature = tuple[int, int]
@@ -61,6 +72,8 @@ class Collector:
         self.cline_task_history = cline_task_history or self.settings.cline_task_history
         self.hermes_db = hermes_db or self.settings.hermes_db
         self.database = UsageDatabase(self.settings.db_path, hostname=self.settings.hostname, persistent=True)
+        self.gateway = GatewayLog(self.settings.gateway_log) if self.settings.gateway_log else None
+        self._gateway_pending: list[tuple[int, UsageEvent]] = []  # (line offset, event) younger than the grace period
         self.forwarder = Forwarder(self.settings, self.database)
         self.pricing_file = self.settings.pricing_file
         self.pricing = Pricing.load(self.pricing_file)
@@ -76,6 +89,7 @@ class Collector:
         self._refresh_pricing()
         prepare = self._prepare
         inserted = self._scan_claude()
+        inserted += self._scan_gateway()  # after the transcripts, so this poll's main turns are already stored
         if self._changed(self._sources, self.cline_db):
             inserted += self.database.insert_events(prepare(parse_cline_sqlite(self.cline_db)))
         if self._changed(self._sources, self.cline_task_history):
@@ -154,6 +168,37 @@ class Collector:
             del self._transcripts[stale]
         return inserted
 
+    def _scan_gateway(self) -> int:
+        """Store the gateway lines older than the grace period whose message id no stored row has."""
+        if self.gateway is None:
+            return 0
+        inserted = 0
+        while True:  # one chunk at a time, so a long log is never held in memory at once
+            before = self.gateway.offset
+            chunk = self.gateway.read()
+            if chunk:
+                self._parsed = True
+                self._gateway_pending.extend(chunk)
+            inserted += self._store_gateway_lines()
+            if self.gateway.offset == before:
+                return inserted
+
+    def _store_gateway_lines(self) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=GATEWAY_GRACE_SECONDS)
+        ripe = [event for _, event in self._gateway_pending if event.timestamp <= cutoff]
+        if not ripe:
+            return 0
+        self._gateway_pending = [(offset, event) for offset, event in self._gateway_pending if event.timestamp > cutoff]
+        # A response's transcript row carries the time of its first line, up to a long generation earlier.
+        window = timedelta(seconds=CLAUDE_DEDUPE_WINDOW_SECONDS)
+        known = self.database.message_ids(min(e.timestamp for e in ripe) - window, max(e.timestamp for e in ripe) + window)
+        side = [e for e in ripe if e.source_id.removeprefix(GATEWAY_SOURCE_PREFIX) not in known]
+        projects = {session: session_project(self.root, session) for session in {e.conversation_id for e in side}}
+        inserted = self.database.insert_events(self._prepare(replace(e, project=projects[e.conversation_id]) for e in side))
+        offset = self._gateway_pending[0][0] if self._gateway_pending else self.gateway.offset
+        self.database.set_meta(GATEWAY_META_KEY, {"path": str(self.gateway.path), "inode": self.gateway.inode, "offset": offset})
+        return inserted
+
     def save_state(self) -> None:
         """Record which transcript versions are fully stored, for `restore_state` at the next start."""
         self.database.set_meta(
@@ -174,6 +219,10 @@ class Collector:
             path = Path(name)
             transcript = self._transcripts[path] = ClaudeTranscript(path, self.root)
             transcript.signature = tuple(signature)
+        # The gateway position is kept after each store, not only at a clean shutdown.
+        position = self.database.get_meta(GATEWAY_META_KEY) or {}
+        if self.gateway is not None and position.get("path") == str(self.gateway.path):
+            self.gateway.offset, self.gateway.inode = int(position.get("offset") or 0), position.get("inode")
         return len(saved)
 
     def _changed(self, registry: dict[Path, Signature], path: Path | None) -> bool:
@@ -200,9 +249,9 @@ class Collector:
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
 
-        log.info("collector started on %s: claude=%s hermes=%s cline=%s db=%s remote=%s",
-                 self.settings.hostname, self.root, self.hermes_db, self.cline_db or self.cline_task_history,
-                 self.database.path, self.settings.remote_url or "off")
+        log.info("collector started on %s: claude=%s gateway=%s hermes=%s cline=%s db=%s remote=%s",
+                 self.settings.hostname, self.root, self.settings.gateway_log, self.hermes_db,
+                 self.cline_db or self.cline_task_history, self.database.path, self.settings.remote_url or "off")
         try:
             restored = self.restore_state()
         except Exception:  # noqa: BLE001 - without it the first scan reads every transcript

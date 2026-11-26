@@ -46,6 +46,7 @@ class Settings:
     cline_db: Path | None = None
     cline_task_history: Path | None = None
     hermes_db: Path | None = None
+    gateway_log: Path | None = None
     pricing_file: Path | None = None
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
@@ -97,6 +98,7 @@ def get_settings() -> Settings:
     cline_db = _env_path("TOKEN_TRACKER_CLINE_DB") or _discover_cline_db()
     cline_task_history = _env_path("TOKEN_TRACKER_CLINE_TASK_HISTORY") or _discover_cline_task_history()
     hermes_db = _env_path("TOKEN_TRACKER_HERMES_DB") or Path(_HERMES_STATE_DB_DEFAULT).expanduser()
+    gateway_log = _env_path("TOKEN_TRACKER_GATEWAY_LOG") or data_dir / "gateway-usage.jsonl"
     pricing_file = _env_path("TOKEN_TRACKER_PRICING") or data_dir / "pricing.json"
     port = int(os.environ.get("TOKEN_TRACKER_PORT", DEFAULT_PORT))
     poll_seconds = float(os.environ.get("TOKEN_TRACKER_POLL_SECONDS", "2"))
@@ -116,6 +118,7 @@ def get_settings() -> Settings:
         cline_db=cline_db,
         cline_task_history=cline_task_history,
         hermes_db=hermes_db,
+        gateway_log=gateway_log,
         pricing_file=pricing_file,
         host=os.environ.get("TOKEN_TRACKER_HOST", DEFAULT_HOST),
         port=port,

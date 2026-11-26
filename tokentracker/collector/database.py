@@ -246,6 +246,15 @@ class UsageDatabase:
             ).fetchall()
         return _dicts(rows)
 
+    def message_ids(self, start: datetime, end: datetime) -> set[str]:
+        """Return the API message ids of the events from *start* to *end*."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT json_extract(metadata_json, '$.message_id') FROM usage_events WHERE timestamp BETWEEN ? AND ?",
+                (start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat()),
+            )
+            return {row[0] for row in rows if row[0]}
+
     def pending_forward(self, limit: int = 500) -> list[tuple[int, UsageEvent]]:
         """Local events not yet pushed to the remote tracker, oldest first."""
         with self.connect() as connection:
