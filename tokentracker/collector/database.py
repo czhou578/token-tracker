@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tokentracker.collector.models import UsageEvent
+from tokentracker.collector.models import ACTIVITY_KINDS, ActivityEvent, UsageEvent
 
 if TYPE_CHECKING:
     from tokentracker.collector.pricing import Pricing
@@ -49,6 +49,27 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- One row for each reply, tool call, or scheduled run (`ActivityEvent`). The
+-- index leads with timestamp for the window filter and holds every column the
+-- highlights query reads, as the rollup index does for usage_events.
+CREATE TABLE IF NOT EXISTS activity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT,
+    thread_id TEXT,
+    project TEXT,
+    provider TEXT NOT NULL,
+    host TEXT,
+    model TEXT,
+    synced INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_events_rollup ON activity_events (
+    timestamp, host, provider, kind, name, model, project, thread_id
+);
 """
 
 # Leads with timestamp for the window filter and holds every column the
@@ -71,6 +92,8 @@ CLAUDE_DEDUPE_MARKER = "claude_response_dedupe_v1"
 # generation can spread them over several minutes (472 s observed). This is the
 # widest gap still treated as the same response when the transcript is gone.
 CLAUDE_DEDUPE_WINDOW_SECONDS = 1800
+
+ACTIVITY_COLUMNS = ("source_id", "timestamp", "kind", "name", "thread_id", "project", "provider", "host", "model")
 
 INSERT_COLUMNS = (
     "source_id",
@@ -235,6 +258,27 @@ class UsageDatabase:
         )
         return self._write(_UPSERT_SQL, stamped)
 
+    def insert_activity(self, events: Iterable[ActivityEvent]) -> int:
+        """Insert new activity rows; rows whose ``source_id`` already exists are left alone.
+
+        A row without a host gets the name of this machine. A row whose kind is
+        not in `ACTIVITY_KINDS` is dropped, because no count would show it.
+        """
+        rows = [
+            (
+                event.source_id, event.timestamp.astimezone(timezone.utc).isoformat(), event.kind, event.name,
+                event.thread_id, event.project, event.provider, event.host or self.hostname, event.model,
+            )
+            for event in events
+            if event.kind in ACTIVITY_KINDS
+        ]
+        if not rows:
+            return 0
+        with self.connect() as connection:
+            before = connection.total_changes
+            connection.executemany(_INSERT_ACTIVITY_SQL, rows)
+            return connection.total_changes - before
+
     def hosts(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -357,6 +401,44 @@ class UsageDatabase:
                 values,
             ).fetchone()
         return _dict(row)
+
+    def highlights(self, **filters: Any) -> dict[str, Any]:
+        """The activity counts of the dashboard: chats, replies, bots, tool calls, tools, scheduled runs.
+
+        A chat is a thread and a bot is a provider, so both come from
+        `usage_events`. `bots_total` counts the providers of all time and
+        `activity_since` is the time of the oldest activity row; both ignore
+        every filter except the machine. The dashboard shows "N of M" bots and
+        the date from which replies, tool calls and scheduled runs are counted.
+        """
+        where, values = self._filters(filters)
+        machine, machine_values = self._filters({"host": filters.get("host")})
+        with self.connect() as connection:
+            usage = connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT thread_id) AS chats, COUNT(DISTINCT provider) AS bots_used
+                FROM usage_events {where}
+                """,
+                values,
+            ).fetchone()
+            bots_total = connection.execute(
+                f"SELECT COUNT(DISTINCT provider) FROM usage_events {machine}", machine_values
+            ).fetchone()[0]
+            activity = connection.execute(
+                f"""
+                SELECT
+                    COUNT(CASE WHEN kind = 'reply' THEN 1 END) AS replies,
+                    COUNT(CASE WHEN kind = 'tool_call' THEN 1 END) AS tool_calls,
+                    COUNT(DISTINCT CASE WHEN kind = 'tool_call' THEN name END) AS tools_used,
+                    COUNT(CASE WHEN kind = 'scheduled_run' THEN 1 END) AS scheduled_runs
+                FROM activity_events {where}
+                """,
+                values,
+            ).fetchone()
+            since = connection.execute(
+                f"SELECT MIN(timestamp) FROM activity_events {machine}", machine_values
+            ).fetchone()[0]
+        return _dict(usage) | {"bots_total": bots_total} | _dict(activity) | {"activity_since": since}
 
     def daily(self, **filters: Any) -> list[dict[str, Any]]:
         return self._grouped("date(timestamp)", "day", filters)
@@ -530,6 +612,11 @@ class UsageDatabase:
 _INSERT_SQL = f"""
 INSERT OR IGNORE INTO usage_events ({", ".join(INSERT_COLUMNS)})
 VALUES ({", ".join("?" for _ in INSERT_COLUMNS)})
+"""
+
+_INSERT_ACTIVITY_SQL = f"""
+INSERT OR IGNORE INTO activity_events ({", ".join(ACTIVITY_COLUMNS)})
+VALUES ({", ".join("?" for _ in ACTIVITY_COLUMNS)})
 """
 
 _UPDATE_COLUMNS = tuple(column for column in INSERT_COLUMNS if column != "source_id")

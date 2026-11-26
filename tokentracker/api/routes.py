@@ -52,6 +52,7 @@ def _filters(
 # Endpoints to auto-register (route name = database method name)
 _ROUTE_METHODS = {
     "stats",
+    "highlights",
     "daily",
     "series",
     "models",

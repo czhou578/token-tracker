@@ -8,7 +8,7 @@ import sqlite3
 
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
-from tokentracker.collector.models import UsageEvent
+from tokentracker.collector.models import ActivityEvent, UsageEvent
 from tokentracker.collector.pricing import Pricing
 
 
@@ -486,3 +486,73 @@ def test_persistent_database_reopens_after_a_sqlite_error(tmp_path) -> None:
     with database.connect() as after:
         assert after is not before
     database.close()
+
+
+def test_highlights_count_chats_bots_and_activity(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", hostname="desk")
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=60)
+    database.insert_events([
+        UsageEvent(source_id="a:1", timestamp=now, thread_id="t1", provider="claude", prompt_tokens=1),
+        UsageEvent(source_id="a:2", timestamp=now, thread_id="t1", provider="claude", prompt_tokens=1),
+        UsageEvent(source_id="a:3", timestamp=now, thread_id="t2", provider="hermes", prompt_tokens=1),
+        UsageEvent(source_id="a:4", timestamp=old, thread_id="t3", provider="cline", prompt_tokens=1),
+    ])
+    activity = [
+        ActivityEvent(source_id="reply:m1", kind="reply", timestamp=now, thread_id="t1"),
+        ActivityEvent(source_id="tool:c1", kind="tool_call", name="Bash", timestamp=now, thread_id="t1"),
+        ActivityEvent(source_id="tool:c2", kind="tool_call", name="Bash", timestamp=now, thread_id="t1"),
+        ActivityEvent(source_id="tool:c3", kind="tool_call", name="web_search", timestamp=now, thread_id="t2", provider="hermes"),
+        ActivityEvent(source_id="run:r1", kind="scheduled_run", timestamp=now, thread_id="t2", provider="hermes"),
+        ActivityEvent(source_id="tool:c0", kind="tool_call", name="Read", timestamp=old, thread_id="t3", provider="cline"),
+        ActivityEvent(source_id="x:1", kind="unknown", timestamp=now),
+    ]
+
+    assert database.insert_activity(activity) == 6  # the unknown kind is dropped
+    assert database.insert_activity(activity) == 0
+
+    assert database.highlights() == {
+        "chats": 3, "bots_used": 3, "bots_total": 3,
+        "replies": 1, "tool_calls": 4, "tools_used": 3, "scheduled_runs": 1,
+        "activity_since": old.isoformat(),
+    }
+    week = database.highlights(window="7d")
+    assert (week["chats"], week["bots_used"], week["bots_total"]) == (2, 2, 3)
+    assert (week["tool_calls"], week["tools_used"]) == (3, 2)
+    assert week["activity_since"] == old.isoformat()  # the oldest row, whatever the window
+    hermes = database.highlights(provider="hermes")
+    assert (hermes["replies"], hermes["tool_calls"], hermes["tools_used"], hermes["scheduled_runs"]) == (0, 1, 1, 1)
+
+
+def test_highlights_follow_the_machine(tmp_path) -> None:
+    database = UsageDatabase(tmp_path / "usage.db", hostname="desk")
+    database.insert_events([UsageEvent(source_id="a:1", thread_id="t1", prompt_tokens=1, host="desk")])
+    database.ingest_events("laptop", [UsageEvent(source_id="b:1", thread_id="t9", provider="hermes", prompt_tokens=1)])
+    database.insert_activity([
+        ActivityEvent(source_id="tool:c1", kind="tool_call", name="Bash"),  # no host: this machine
+        ActivityEvent(source_id="tool:c2", kind="tool_call", name="Edit", host="laptop"),
+    ])
+
+    desk = database.highlights(host="desk")
+    assert (desk["chats"], desk["bots_used"], desk["bots_total"], desk["tool_calls"]) == (1, 1, 1, 1)
+    assert database.highlights(host="laptop")["tools_used"] == 1
+    assert database.highlights()["bots_total"] == 2
+    empty = database.highlights(host="nobody")
+    assert empty["tool_calls"] == 0 and empty["activity_since"] is None
+
+
+def test_init_adds_the_activity_table_to_old_databases(tmp_path) -> None:
+    path = tmp_path / "usage.db"
+    UsageDatabase(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE activity_events")
+
+    database = UsageDatabase(path)
+
+    assert database.highlights()["tool_calls"] == 0
+    with sqlite3.connect(path) as connection:
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(DISTINCT name) FROM activity_events WHERE timestamp >= ? AND host = ?",
+            ("2026-01-01", "desk"),
+        ).fetchall()
+    assert any("COVERING INDEX idx_activity_events_rollup" in row[3] for row in plan)
