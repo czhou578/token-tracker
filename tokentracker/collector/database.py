@@ -279,6 +279,17 @@ class UsageDatabase:
             connection.executemany(_INSERT_ACTIVITY_SQL, rows)
             return connection.total_changes - before
 
+    def ingest_activity(self, host: str, events: Iterable[ActivityEvent]) -> int:
+        """Store activity rows pushed from another machine, with the `source_id` namespaced as in `ingest_events`."""
+        host = host.strip()
+        if not host:
+            return 0
+        return self.insert_activity(
+            replace(event, host=host, source_id=f"{host}::{event.source_id}")
+            for event in events
+            if not event.source_id.startswith(f"{host}::")
+        )
+
     def hosts(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -310,10 +321,29 @@ class UsageDatabase:
         return [(row["id"], _event_from_row(row)) for row in rows]
 
     def pending_forward_count(self) -> int:
+        """The local usage events and activity rows not yet pushed to the remote tracker."""
         with self.connect() as connection:
-            return connection.execute(
-                "SELECT COUNT(*) FROM usage_events WHERE synced = 0 AND host = ?", (self.hostname,)
-            ).fetchone()[0]
+            return sum(
+                connection.execute(f"SELECT COUNT(*) FROM {table} WHERE synced = 0 AND host = ?", (self.hostname,)).fetchone()[0]
+                for table in ("usage_events", "activity_events")
+            )
+
+    def pending_activity_forward(self, limit: int = 500) -> list[tuple[int, ActivityEvent]]:
+        """Local activity rows not yet pushed to the remote tracker, oldest first."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id, {', '.join(ACTIVITY_COLUMNS)} FROM activity_events "
+                "WHERE synced = 0 AND host = ? ORDER BY id LIMIT ?",
+                (self.hostname, limit),
+            ).fetchall()
+        return [
+            (row["id"], ActivityEvent(**{c: row[c] for c in ACTIVITY_COLUMNS} | {"timestamp": datetime.fromisoformat(row["timestamp"])}))
+            for row in rows
+        ]
+
+    def mark_activity_forwarded(self, ids: Iterable[int]) -> None:
+        with self.connect() as connection:
+            connection.executemany("UPDATE activity_events SET synced = 1 WHERE id = ?", [(i,) for i in ids])
 
     def mark_forwarded(self, ids: Iterable[int]) -> None:
         ids = list(ids)

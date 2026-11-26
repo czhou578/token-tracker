@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from tokentracker.collector.config import Settings, get_settings
-from tokentracker.collector.models import UsageEvent
+from tokentracker.collector.models import ActivityEvent, UsageEvent
 from tokentracker.collector.database import UsageDatabase
 from tokentracker.collector.pricing import (
     LONG_PROMPT_THRESHOLD,
@@ -103,6 +103,7 @@ MAX_INGEST_BYTES = 8 * 1024 * 1024  # a 500-event batch is about 0.3 MB
 class IngestBatch(BaseModel):
     host: str = Field(min_length=1, max_length=120)
     events: list[UsageEvent] = Field(max_length=MAX_INGEST_BATCH)
+    activity: list[ActivityEvent] = Field(default_factory=list, max_length=MAX_INGEST_BATCH)
 
 
 def load_ingest_token(settings: Settings) -> str | None:
@@ -155,7 +156,10 @@ async def ingest(request: Request) -> dict[str, int]:
     # only when the rates change, so it would never correct a sender's prices.
     pricing = Pricing.load(settings.pricing_file)
     accepted = await run_in_threadpool(database.ingest_events, batch.host, pricing.price_events(batch.events))
-    return {"accepted": accepted, "received": len(batch.events)}
+    activity = await run_in_threadpool(database.ingest_activity, batch.host, batch.activity)
+    # A sender marks its activity rows as sent only when the reply has "activity":
+    # a tracker from before activity collection ignores the field and does not confirm it.
+    return {"accepted": accepted, "received": len(batch.events), "activity": activity}
 
 
 @router.get("/pricing")

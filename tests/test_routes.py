@@ -62,7 +62,7 @@ def test_ingest_checks_the_token_before_reading_the_body(client) -> None:
     assert bad.status_code == 422
 
     ok = http.post("/api/events", json={"host": "laptop", "events": [EVENT]}, headers={"Authorization": "Bearer secret"})
-    assert ok.status_code == 200 and ok.json() == {"accepted": 1, "received": 1}
+    assert ok.status_code == 200 and ok.json() == {"accepted": 1, "received": 1, "activity": 0}
     hosts = {row["host"]: row["events"] for row in http.get("/api/hosts").json()}
     assert hosts["laptop"] == 1
 
@@ -161,3 +161,48 @@ def test_dashboard_has_the_activity_tiles(client) -> None:
     assert 'id="threads"' not in page  # the Threads card is now the Chats tile
     script = http.get("/assets/app.js").text
     assert 'get("highlights")' in script and "#threads" not in script
+
+
+def test_ingest_stores_the_activity_of_another_machine(client) -> None:
+    http, home = client
+    (home / "ingest_token").write_text("secret\n")
+    activity = [
+        {"source_id": "tool:c1", "kind": "tool_call", "name": "Bash", "thread_id": "t1", "timestamp": "2026-10-31T10:00:00Z"},
+        {"source_id": "tool:c2", "kind": "tool_call", "name": "Edit", "thread_id": "t1", "timestamp": "2026-10-31T10:00:01Z"},
+        {"source_id": "reply:m1", "kind": "reply", "thread_id": "t1", "timestamp": "2026-10-31T10:00:02Z"},
+        {"source_id": "run:r1", "kind": "scheduled_run", "provider": "hermes", "timestamp": "2026-10-31T10:00:03Z"},
+    ]
+    for accepted in (4, 0):  # a second push of the same rows adds nothing
+        response = http.post("/api/events", json={"host": "laptop", "events": [], "activity": activity}, headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200 and response.json() == {"accepted": 0, "received": 0, "activity": accepted}
+
+    counts = http.get("/api/highlights", params={"host": "laptop"}).json()
+    assert (counts["replies"], counts["tool_calls"], counts["tools_used"], counts["scheduled_runs"]) == (1, 2, 2, 1)
+    assert set(counts["activity_since"]) == {"claude", "hermes"}
+    assert http.get("/api/highlights", params={"host": "desk"}).json()["tool_calls"] == 0
+    bad = http.post("/api/events", json={"host": "laptop", "events": [], "activity": [{"kind": "reply"}]}, headers={"Authorization": "Bearer secret"})
+    assert bad.status_code == 422
+
+
+def test_the_forwarder_and_the_ingest_endpoint_agree_on_the_wire_form(client, tmp_path) -> None:
+    from dataclasses import replace
+
+    from tokentracker.collector.database import UsageDatabase
+    from tokentracker.collector.forwarder import Forwarder
+    from tokentracker.collector.models import ActivityEvent, UsageEvent
+
+    http, home = client
+    (home / "ingest_token").write_text("secret\n")
+    sender = UsageDatabase(tmp_path / "sender.db", hostname="laptop")
+    sender.insert_events([UsageEvent(source_id="e1", thread_id="t1", host="laptop", prompt_tokens=5)])
+    sender.insert_activity([
+        ActivityEvent(source_id="tool:c1", kind="tool_call", name="Bash", thread_id="t1", project="repo", model="m"),
+        ActivityEvent(source_id="run:r1", kind="scheduled_run", thread_id="t1"),
+    ])
+    settings = replace(get_settings(), remote_url="http://main", remote_token="secret", hostname="laptop")
+    forwarder = Forwarder(settings, sender)
+    forwarder._post = lambda payload: http.post("/api/events", json=payload, headers={"Authorization": "Bearer secret"}).json()
+
+    assert forwarder.flush() == 3 and sender.pending_forward_count() == 0
+    counts = http.get("/api/highlights", params={"host": "laptop"}).json()
+    assert (counts["chats"], counts["tool_calls"], counts["tools_used"], counts["scheduled_runs"]) == (1, 1, 1, 1)

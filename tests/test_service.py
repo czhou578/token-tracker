@@ -360,3 +360,24 @@ def test_collector_stores_hermes_activity_and_keeps_its_position(isolated, monke
     restarted.scan_once()
     assert starts == [3]  # the position survives a restart
     assert _counts(restarted) == (1, 2, 2, 1)
+
+
+def test_collector_tells_the_forwarder_about_activity_without_new_usage(isolated, monkeypatch):
+    transcript = isolated / "claude" / "proj" / "a.jsonl"
+    transcript.parent.mkdir()
+    lines = _activity_lines().splitlines(keepends=True)
+    transcript.write_text("".join(lines[:3]))  # the schedule line and two responses
+    collector = Collector()
+    told: list[int] = []
+    monkeypatch.setattr(collector.forwarder, "notify", lambda: told.append(1))
+    collector.scan_once()
+    assert len(told) == 1 and collector.scan_once() == 0 and len(told) == 1
+
+    # A later line of a response that is already counted: a new tool call, no new usage event.
+    extra = json.loads(lines[2])
+    extra["message"]["content"] = [{"type": "tool_use", "id": "toolu_9", "name": "Read"}]
+    with transcript.open("a") as handle:
+        handle.write(json.dumps(extra) + "\n")
+    _bump_mtime(transcript)
+    assert collector.scan_once() == 0
+    assert len(told) == 2 and collector.database.highlights()["tool_calls"] == 4

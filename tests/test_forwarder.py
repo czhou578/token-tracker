@@ -10,7 +10,7 @@ import pytest
 from tokentracker.collector.config import get_settings
 from tokentracker.collector.database import UsageDatabase
 from tokentracker.collector.forwarder import Forwarder, export_event, hashed_project
-from tokentracker.collector.models import UsageEvent
+from tokentracker.collector.models import ActivityEvent, UsageEvent
 
 
 class _Response(io.BytesIO):
@@ -117,3 +117,51 @@ def test_forwarder_queries_only_after_new_events(linked, monkeypatch) -> None:
     forwarder.notify()
     assert forwarder.flush() == 1
     assert len(queries) == 2
+
+
+def _server(monkeypatch, reply: bytes) -> list[dict]:
+    payloads: list[dict] = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=0: payloads.append(json.loads(request.data)) or _Response(reply))
+    return payloads
+
+
+def test_forwarder_posts_activity_rows_in_their_own_batch(linked, monkeypatch) -> None:
+    settings, database = linked
+    database.insert_events([UsageEvent(source_id="e1", provider="claude", host="laptop", prompt_tokens=1)])
+    database.insert_activity([
+        ActivityEvent(source_id="tool:c1", kind="tool_call", name="Bash", thread_id="s1", project="secret-repo", model="claude-opus-5-5"),
+        ActivityEvent(source_id="reply:m1", kind="reply", thread_id="s1", project="secret-repo"),
+        ActivityEvent(source_id="tool:c9", kind="tool_call", name="Edit", host="other"),  # not from this machine
+    ])
+    payloads = _server(monkeypatch, b'{"accepted": 1, "received": 1, "activity": 2}')
+    forwarder = Forwarder(settings, database)
+
+    assert database.pending_forward_count() == 3
+    assert forwarder.flush() == 3
+    assert [(len(p["events"]), len(p.get("activity", []))) for p in payloads] == [(1, 0), (0, 2)]
+    call = payloads[1]["activity"][0]
+    assert (call["source_id"], call["kind"], call["name"], call["host"], call["model"]) == ("tool:c1", "tool_call", "Bash", "laptop", "claude-opus-5-5")
+    assert call["project"] == hashed_project("secret-repo", settings.project_salt)
+    assert database.pending_forward_count() == 0
+    assert forwarder.flush() == 0 and len(payloads) == 2
+
+
+def test_forwarder_keeps_activity_for_a_remote_that_does_not_confirm_it(linked, monkeypatch) -> None:
+    settings, database = linked
+    database.insert_events([UsageEvent(source_id="e1", provider="claude", host="laptop", prompt_tokens=1)])
+    database.insert_activity([ActivityEvent(source_id="tool:c1", kind="tool_call", name="Bash")])
+    payloads = _server(monkeypatch, b'{"accepted": 1, "received": 1}')  # a tracker from before activity collection
+    forwarder = Forwarder(settings, database)
+
+    assert forwarder.flush() == 1  # the usage event went
+    assert database.pending_forward_count() == 1 and len(database.pending_activity_forward()) == 1
+    database.insert_events([UsageEvent(source_id="e2", provider="claude", host="laptop", prompt_tokens=1)])
+    forwarder.notify()
+    assert forwarder.flush() == 1
+    assert len(payloads) == 3 and "activity" not in payloads[2]  # not offered again inside the hour
+
+    payloads.clear()
+    forwarder._activity_after = 0.0  # the hour is over and the remote is updated
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=0: payloads.append(json.loads(request.data)) or _Response(b'{"activity": 1}'))
+    forwarder.notify()
+    assert forwarder.flush() == 1 and database.pending_forward_count() == 0

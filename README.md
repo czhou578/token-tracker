@@ -108,7 +108,7 @@ Claude Code transcripts and from the `messages` table of Hermes:
 - Each action has the id that its source gives it. A session that Claude Code copies to a second file, or a row
   that Hermes writes again when it compacts a session, counts once.
 - Cline and pushed sources give no activity yet. They count as chats and bots only.
-- A second machine does not send its activity yet. Its replies, tool calls and scheduled runs are missing.
+- A second machine sends its activity with its usage events (see [Second machine](#second-machine)).
 
 `GET /api/highlights` returns the same counts, with the filters of `/api/stats`.
 
@@ -232,8 +232,10 @@ of its agent benchmark, with `provider = "agent-eval"`.
 
 Every event carries the name of the machine it came from, and the dashboard gets a machine selector when
 more than one is present. A second machine (for example a work laptop) runs the same collector and pushes
-its events to the main tracker over HTTPS. Only token counts, model names, timestamps, and a salted hash of
-each project name leave the machine; paths and titles never do. The laptop keeps its own copy and catches up
+its events to the main tracker over HTTPS. Only token counts, model names, timestamps, a salted hash of
+each project name, and the activity rows leave the machine; paths and titles never do. An activity row is one
+reply, tool call, or scheduled run. A tool call carries the name of the tool (for example `Bash`, or the name of
+an MCP tool, which holds the name of its server). It carries no arguments and no results. The laptop keeps its own copy and catches up
 after being offline.
 
 ### On the main tracker
@@ -293,6 +295,10 @@ tracker status
 `link` saves the remote URL, the token, and a random salt for project hashing in `~/.tokentracker/config.json`
 (mode 600). Pass `--project-labels clear` to send real project names. `tracker status` shows the pending
 count and the last successful push; `tracker unlink` stops forwarding.
+
+When you update both machines, update the main tracker first. A main tracker from before the activity counts
+stores the usage events and does not confirm the activity rows. The second machine then keeps its activity rows
+and offers them again each hour, so nothing is lost.
 
 Claude Code writes its transcripts to `~/.claude/projects` on Linux and macOS, so no configuration is needed
 for Claude Code. If Claude Code uses a different config directory (`CLAUDE_CONFIG_DIR`), set
