@@ -464,3 +464,62 @@ def test_session_project_finds_the_transcript_of_a_session(tmp_path) -> None:
     (tmp_path / "proj" / "s1.jsonl").write_text("")
     assert session_project(tmp_path, "s1") == "proj"
     assert session_project(tmp_path, "s2") is None and session_project(tmp_path, None) is None
+
+
+def _line(kind: str, **fields) -> str:
+    return json.dumps({"type": kind, "sessionId": "s", "timestamp": "2026-10-31T10:00:00Z"} | fields) + "\n"
+
+
+def _reply(message_id: str, content: list, stop_reason: str | None = None, **fields) -> str:
+    message = {"id": message_id, "model": "claude-opus-5-5", "stop_reason": stop_reason,
+               "usage": {"input_tokens": 7, "output_tokens": 1}, "content": content}
+    return _line("assistant", message=message, **fields)
+
+
+def _tool(call_id: str, name: str) -> dict:
+    return {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+
+
+def test_transcript_collects_tool_calls_replies_and_scheduled_runs(tmp_path) -> None:
+    path = tmp_path / "proj" / "chat.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        _reply("msg_1", [{"type": "thinking"}])
+        + _reply("msg_1", [_tool("toolu_1", "Bash")], "tool_use")
+        + _reply("msg_1", [_tool("toolu_2", "Edit"), {"type": "server_tool_use", "id": "srv_1", "name": "web_search"}], "tool_use")
+        + _reply("msg_2", [{"type": "text"}], "end_turn")
+        + _reply("msg_3", [_tool("toolu_3", "Read")], "end_turn", isSidechain=True)  # a subagent: no reply
+        + _line("system", subtype="scheduled_task_fire", uuid="fire-1", taskId="t1")
+        + _line("system", subtype="turn_duration", uuid="other")
+        + _line("user", message={"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]})
+    )
+    reader = ClaudeTranscript(path, tmp_path)
+
+    assert len(reader.read()) == 3  # one usage event for each response, as before
+    found = {event.source_id: event for event in reader.activity}
+    assert {source_id: (event.kind, event.name) for source_id, event in found.items()} == {
+        "tool:toolu_1": ("tool_call", "Bash"),
+        "tool:toolu_2": ("tool_call", "Edit"),
+        "tool:srv_1": ("tool_call", "web_search"),
+        "tool:toolu_3": ("tool_call", "Read"),
+        "reply:msg_2": ("reply", None),
+        "run:fire-1": ("scheduled_run", None),
+    }
+    call = found["tool:toolu_1"]
+    assert (call.thread_id, call.project, call.provider, call.model) == ("s", "proj", "claude", "claude-opus-5-5")
+    assert call.timestamp == datetime(2026, 10, 31, 10, tzinfo=timezone.utc)
+    assert found["run:fire-1"].model is None
+
+
+def test_transcript_activity_holds_only_the_last_read(tmp_path) -> None:
+    path = tmp_path / "chat.jsonl"
+    path.write_text(_reply("msg_1", [{"type": "thinking"}]))
+    reader = ClaudeTranscript(path, tmp_path)
+    assert len(reader.read()) == 1 and reader.activity == []
+
+    # The tool call of msg_1 arrives later: the response is already counted, the call is not.
+    with path.open("a") as handle:
+        handle.write(_reply("msg_1", [_tool("toolu_1", "Bash")], "tool_use"))
+    assert reader.read() == []
+    assert [event.source_id for event in reader.activity] == ["tool:toolu_1"]
+    assert reader.read() == [] and reader.activity == []

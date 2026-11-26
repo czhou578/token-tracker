@@ -31,6 +31,9 @@ TRANSCRIPTS_META_KEY = "collector_transcripts_v1"
 PRICING_META_KEY = "pricing_fingerprint"
 # The read position in the gateway usage log: the start of the first line not yet stored or dropped.
 GATEWAY_META_KEY = "collector_gateway_log_v1"
+# Set after the collector first ran with activity collection. Until then the saved transcript signatures are not
+# used, so the first scan reads every transcript from the top and stores the activity of the lines read before.
+ACTIVITY_BACKFILL_META_KEY = "activity_backfill_v1"
 # The gateway log holds every response of a local model. The transcripts hold the main turns, written within seconds
 # of the response. A gateway line waits this long before it is compared with the stored transcript rows, so a main
 # turn counts once, from its transcript, and only the side requests count from the log.
@@ -161,6 +164,9 @@ class Collector:
                 events = transcript.read(stat)
                 if events:
                     inserted += self.database.insert_events(self._prepare(events))
+                if transcript.activity:
+                    self.database.insert_activity(transcript.activity)
+                    transcript.activity = []
             except Exception:
                 transcript.reset()  # read it from the top next time, so nothing is skipped
                 raise
@@ -215,6 +221,10 @@ class Collector:
         """
         saved = self.database.get_meta(TRANSCRIPTS_META_KEY) or {}
         self.database.delete_meta(TRANSCRIPTS_META_KEY)
+        if not self.database.get_meta(ACTIVITY_BACKFILL_META_KEY):
+            # A crash before the scan ends leaves no saved signatures, so the next start reads everything too.
+            self.database.set_meta(ACTIVITY_BACKFILL_META_KEY, datetime.now(timezone.utc).isoformat())
+            saved = {}
         for name, signature in saved.items():
             path = Path(name)
             transcript = self._transcripts[path] = ClaudeTranscript(path, self.root)
