@@ -103,6 +103,25 @@ Hermes records whatever model its `config.yaml` names, including a local model b
 
 Hermes usage is labelled with `provider = "hermes"` and aggregated alongside Claude Code and Cline.
 
+## Local models behind a gateway
+
+Claude Code can use a local model through a gateway on `ANTHROPIC_BASE_URL` (for example the colinfer gateway,
+`engine/server/gateway.py`). Claude Code writes the usage of its main turns to the transcript. It does not write the
+usage of side requests, such as the session title. Thus the transcripts miss some tokens of a local model.
+
+The gateway can write one JSON line per response to `~/.tokentracker/gateway-usage.jsonl` (override with
+`TOKEN_TRACKER_GATEWAY_LOG`):
+
+```json
+{"ts": "2026-11-02T00:45:06.169Z", "id": "chatcmpl-943ae10adc93a1d6", "model": "deepseek-v4-flash-0731", "dest": "deepseek", "session": "fceb4b6a-...", "usage": {"input_tokens": 228, "output_tokens": 340, "cache_read_input_tokens": 512}}
+```
+
+The collector reads the new lines on each poll. Each line waits 60 seconds, so the transcript row of a main turn is
+stored first. Then the collector drops each line whose message id a stored row already has. The remaining lines are
+the side requests. The collector stores them with `provider = "claude"`, the session as the thread, and the project of
+the session's transcript. Thus each response counts once. The read position is kept in the database, so a restart
+does not read the file again.
+
 ## Cost Estimates
 
 Every event carries `cost_usd`, an estimate at Anthropic's published list prices. The dashboard shows the

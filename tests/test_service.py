@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -206,3 +207,50 @@ def test_collector_prices_events_and_reloads_overrides(isolated):
     hermes = collector.database.stats(provider="hermes")
     assert hermes["priced_requests"] == 1
     assert hermes["cost_usd"] == pytest.approx(0.14)
+
+
+def _gateway_line(message_id: str, ts: str, tokens: int) -> str:
+    return json.dumps({"ts": ts, "id": message_id, "model": "deepseek-v4-flash-0731", "dest": "deepseek", "session": "s1",
+                       "usage": {"input_tokens": tokens, "output_tokens": 1}}) + "\n"
+
+
+def _gateway_log(isolated: Path) -> Path:
+    path = isolated / "home" / "gateway-usage.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_gateway_lines_count_only_the_responses_no_transcript_holds(isolated):
+    transcript = isolated / "claude" / "proj" / "s1.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_text(json.dumps({
+        "timestamp": "2026-10-31T10:00:00Z", "sessionId": "s1", "uuid": "u1",
+        "message": {"id": "chatcmpl-main", "model": "deepseek-v4-flash-0731", "usage": {"input_tokens": 10, "output_tokens": 1}},
+    }) + "\n")
+    _gateway_log(isolated).write_text(_gateway_line("chatcmpl-main", "2026-10-31T10:04:00Z", 10)
+                                      + _gateway_line("chatcmpl-title", "2026-10-31T10:00:02Z", 100))
+    collector = Collector()
+
+    assert collector.scan_once() == 2  # the main turn from its transcript, the session title from the gateway log
+    assert collector.database.stats()["total_tokens"] == 11 + 101
+    with sqlite3.connect(collector.settings.db_path) as connection:
+        rows = connection.execute("SELECT source_id, project, conversation_id FROM usage_events WHERE source_id LIKE 'gateway:%'").fetchall()
+    assert rows == [("gateway:chatcmpl-title", "proj", "s1")]
+    assert collector.scan_once() == 0
+
+
+def test_a_gateway_line_waits_for_the_grace_period_and_its_position_survives_a_restart(isolated, monkeypatch):
+    old = _gateway_line("chatcmpl-old", "2026-10-31T10:00:00Z", 5)
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _gateway_log(isolated).write_text(old + _gateway_line("chatcmpl-new", now, 7))
+    first = Collector()
+    assert first.scan_once() == 1  # the new line waits
+    assert first.database.get_meta(service.GATEWAY_META_KEY)["offset"] == len(old)
+    first.database.close()
+
+    second = Collector()
+    second.restore_state()
+    assert second.gateway.offset == len(old)  # the new line is read again, the old one is not
+    monkeypatch.setattr(service, "GATEWAY_GRACE_SECONDS", 0)
+    assert second.scan_once() == 1
+    assert second.database.stats()["total_tokens"] == 6 + 8

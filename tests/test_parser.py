@@ -7,12 +7,15 @@ from pathlib import Path
 
 from tokentracker.collector.parser import (
     ClaudeTranscript,
+    GatewayLog,
     parse_claude_jsonl,
     parse_claude_record,
     parse_cline_record,
     parse_cline_sqlite,
     parse_cline_task_history,
+    parse_gateway_record,
     parse_hermes_state_db,
+    session_project,
 )
 
 
@@ -413,3 +416,51 @@ def test_transcript_ignores_lines_that_are_not_objects(tmp_path) -> None:
     path = tmp_path / "chat.jsonl"
     path.write_text("[1, 2]\n" + _assistant("msg_1", "text"))
     assert len(parse_claude_jsonl(path, tmp_path)) == 1
+
+
+def _gateway(message_id: str, tokens: int = 7) -> str:
+    return json.dumps({
+        "ts": "2026-10-31T10:00:05.250Z", "id": message_id, "model": "deepseek-v4-flash-0731", "dest": "deepseek",
+        "session": "s1", "usage": {"input_tokens": tokens, "output_tokens": 2, "cache_read_input_tokens": 3},
+    }) + "\n"
+
+
+def test_parse_gateway_record_extracts_usage() -> None:
+    event = parse_gateway_record(json.loads(_gateway("chatcmpl-1")))
+    assert event is not None
+    assert (event.source_id, event.provider, event.model) == ("gateway:chatcmpl-1", "claude", "deepseek-v4-flash-0731")
+    assert (event.prompt_tokens, event.completion_tokens, event.cache_read_tokens, event.total_tokens) == (7, 2, 3, 12)
+    assert event.conversation_id == event.thread_id == "s1" and event.project is None
+    assert event.timestamp == datetime(2026, 10, 31, 10, 0, 5, 250000, tzinfo=timezone.utc)
+    assert json.loads(event.metadata_json) == {"message_id": "chatcmpl-1", "via": "gateway"}
+    assert parse_gateway_record({"usage": {"input_tokens": 5}}) is None  # no id: it cannot be matched with a transcript
+    assert parse_gateway_record({"id": "x", "usage": {"input_tokens": 0}}) is None
+
+
+def test_gateway_log_reads_complete_lines_incrementally(tmp_path) -> None:
+    path = tmp_path / "gateway-usage.jsonl"
+    log = GatewayLog(path)
+    assert log.read() == []  # no file yet
+    first, second = _gateway("a"), _gateway("b")
+    path.write_text(first + "not json\n" + second[:10])
+    assert [(offset, event.source_id) for offset, event in log.read()] == [(0, "gateway:a")]
+    assert log.offset == len(first) + len("not json\n")  # the line being written waits
+    with path.open("a") as handle:
+        handle.write(second[10:])
+    assert [(offset, event.source_id) for offset, event in log.read()] == [(len(first) + 9, "gateway:b")]
+    assert log.read() == []
+
+    path.write_text(_gateway("c"))  # shrunk: start over
+    assert [event.source_id for _, event in log.read()] == ["gateway:c"]
+    replacement = tmp_path / "new.jsonl"
+    replacement.write_text(_gateway("d") * 3)
+    replacement.replace(path)  # another inode: start over
+    assert [event.source_id for _, event in log.read(limit=len(_gateway("d")) + 5)] == ["gateway:d"]
+    assert len(log.read()) == 2
+
+
+def test_session_project_finds_the_transcript_of_a_session(tmp_path) -> None:
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "proj" / "s1.jsonl").write_text("")
+    assert session_project(tmp_path, "s1") == "proj"
+    assert session_project(tmp_path, "s2") is None and session_project(tmp_path, None) is None

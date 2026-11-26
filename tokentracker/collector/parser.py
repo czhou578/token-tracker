@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sqlite3
@@ -185,6 +186,97 @@ def _claude_pricing_metadata(usage: dict, message: object = None) -> dict:
 
 def _dumps(metadata: dict) -> str:
     return json.dumps(metadata, separators=(",", ":")) if metadata else "{}"
+
+
+# ── Gateway usage log ────────────────────────────────────────────────────
+# A gateway between Claude Code and a local model server (for example
+# colin-inference-engine `engine/server/gateway.py --usage-log`) appends one
+# JSON line per response: {"ts", "id", "model", "dest", "session", "usage"}.
+# Claude Code writes the usage of its main turns to the transcript, but not the
+# usage of side requests such as the session title. The collector keeps only
+# the lines whose message id no transcript holds (service.py).
+
+GATEWAY_SOURCE_PREFIX = "gateway:"
+
+
+class GatewayLog:
+    """Reads the gateway usage log incrementally, at most `limit` bytes per read.
+
+    The gateway only appends, so `offset` is always just past a newline. When
+    the file shrinks or is replaced (another inode), reading starts over from
+    the top (the database ignores rows it already has).
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+        self.inode: int | None = None
+
+    def read(self, limit: int = 1 << 22) -> list[tuple[int, UsageEvent]]:
+        """Return the events of the complete lines after `offset`, each with the offset where its line starts."""
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return []
+        if (self.inode is not None and stat.st_ino != self.inode) or stat.st_size < self.offset:
+            self.offset = 0
+        self.inode = stat.st_ino
+        if stat.st_size == self.offset:
+            return []
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            data = handle.read(limit)
+        end = data.rfind(b"\n") + 1
+        if not end and len(data) == limit:
+            end = len(data)  # a line longer than `limit` is not a usage line: skip it, do not stop here
+        events: list[tuple[int, UsageEvent]] = []
+        start = self.offset
+        for raw in data[:end].splitlines(keepends=True):
+            event = _gateway_line(raw)
+            if event is not None:
+                events.append((start, event))
+            start += len(raw)
+        self.offset += end
+        return events
+
+
+def _gateway_line(raw: bytes) -> UsageEvent | None:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parse_gateway_record(payload) if isinstance(payload, dict) else None
+
+
+def parse_gateway_record(payload: dict) -> UsageEvent | None:
+    usage, message_id = payload.get("usage"), payload.get("id")
+    if not isinstance(usage, dict) or not isinstance(message_id, str) or not message_id:
+        return None
+    token_counts = {field: _int(usage.get(key)) for field, key in TOKEN_KEYS.items()}
+    total_tokens = sum(token_counts.values())
+    if total_tokens == 0:
+        return None
+    session = payload.get("session") if isinstance(payload.get("session"), str) else None
+    return UsageEvent(
+        source_id=GATEWAY_SOURCE_PREFIX + message_id,
+        timestamp=_parse_timestamp(payload.get("ts")),
+        thread_id=session,
+        conversation_id=session,
+        provider=CLAUDE_PROVIDER,
+        model=str(payload.get("model") or "unknown"),
+        **token_counts,
+        total_tokens=total_tokens,
+        metadata_json=_dumps({"message_id": message_id, "via": "gateway"}),
+    )
+
+
+def session_project(root: Path, session: str | None) -> str | None:
+    """Return the project of the transcript of a Claude Code session (`<root>/<project>/<session>.jsonl`)."""
+    if not session:
+        return None
+    for path in root.glob(f"*/{glob.escape(session)}.jsonl"):
+        return _project_from_path(path, root)
+    return None
 
 
 # ── Cline ────────────────────────────────────────────────────────────────
