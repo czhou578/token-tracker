@@ -87,6 +87,31 @@ collapses those rows. Transcripts that still exist are re-parsed, so the result 
 Claude Code has already deleted, consecutive rows with identical model and token counts within 30 minutes
 are treated as one response. `tracker status` shows what the migration did.
 
+## Activity counts
+
+Below the token cards, the dashboard shows six counts of activity for the selected window and machine.
+
+| Tile | What it counts |
+| --- | --- |
+| Chats | Sessions with at least one request. One Claude Code session, one Cline task, or one Hermes session is one chat. |
+| Replies | Final answers of the assistant. An answer of a subagent to its parent does not count. |
+| Bots used | Tools that made requests in the window, of all the tools in the database. A tool is a `provider` label: `claude`, `cline`, `hermes`, or the label of a pushed source. |
+| Tool calls | Tool calls of the models. |
+| Tools used | Different tool names among those tool calls. |
+| Scheduled runs | Runs that a schedule started: a scheduled task of Claude Code, or a Hermes cron job. |
+
+Chats and bots come from the usage events, so they cover the full history. The other four counts come from the
+Claude Code transcripts and from the `messages` table of Hermes:
+
+- Claude Code deletes a transcript after 30 days. The first start with this feature reads every transcript that
+  still exists, so these counts start at the oldest one. The tooltip of each tile shows the start date of each tool.
+- Each action has the id that its source gives it. A session that Claude Code copies to a second file, or a row
+  that Hermes writes again when it compacts a session, counts once.
+- Cline and pushed sources give no activity yet. They count as chats and bots only.
+- A second machine does not send its activity yet. Its replies, tool calls and scheduled runs are missing.
+
+`GET /api/highlights` returns the same counts, with the filters of `/api/stats`.
+
 ## Cline
 
 Cline (VS Code extension or CLI) stores its conversation history in a SQLite database. Token Tracker auto-detects it in the usual install locations and ingests it into the same database. To point at a specific file, set `TOKEN_TRACKER_CLINE_DB` to the path of Cline's `cline.db` (or similar).

@@ -3,7 +3,13 @@ const ids = {
   costNote: document.querySelector("#costNote"),
   totalTokens: document.querySelector("#totalTokens"),
   requests: document.querySelector("#requests"),
-  threads: document.querySelector("#threads"),
+  chats: document.querySelector("#chats"),
+  replies: document.querySelector("#replies"),
+  bots: document.querySelector("#bots"),
+  toolCalls: document.querySelector("#toolCalls"),
+  toolsUsed: document.querySelector("#toolsUsed"),
+  scheduledRuns: document.querySelector("#scheduledRuns"),
+  activityTiles: document.querySelectorAll("#highlights article[data-help]"),
   dailyChart: document.querySelector("#dailyChart"),
   seriesTitle: document.querySelector("#seriesTitle"),
   dailyRange: document.querySelector("#dailyRange"),
@@ -130,8 +136,9 @@ async function load() {
   // slow earlier response can never overwrite the window that is now selected.
   const sequence = ++loadSequence;
   await loadHosts();
-  const [stats, series, models, projects, providers] = await Promise.all([
+  const [stats, highlights, series, models, projects, providers] = await Promise.all([
     get("stats"),
+    get("highlights"),
     get("series"),
     get("models"),
     get("projects"),
@@ -139,6 +146,7 @@ async function load() {
   ]);
   if (sequence !== loadSequence) return;
   renderStats(stats);
+  renderHighlights(highlights);
   renderSeries(series);
   renderBars(ids.modelsChart, models, "model");
   renderBars(ids.projectsChart, projects, "project");
@@ -157,7 +165,23 @@ function renderStats(stats) {
   ids.totalTokens.textContent = count(stats.total_tokens);
   ids.totalTokens.title = `${fmt.format(stats.total_tokens || 0)} tokens`;
   ids.requests.textContent = count(stats.requests);
-  ids.threads.textContent = count(stats.threads);
+}
+
+function renderHighlights(highlights) {
+  ids.chats.textContent = count(highlights.chats);
+  ids.replies.textContent = count(highlights.replies);
+  ids.bots.innerHTML = `${count(highlights.bots_used)} <small>of ${count(highlights.bots_total)}</small>`;
+  ids.toolCalls.textContent = count(highlights.tool_calls);
+  ids.toolsUsed.textContent = count(highlights.tools_used);
+  ids.scheduledRuns.textContent = count(highlights.scheduled_runs);
+  // Replies, tool calls and scheduled runs exist only from the oldest transcript that
+  // was still on disk when activity collection started, so each tile says from when.
+  const since = Object.entries(highlights.activity_since || {})
+    .map(([provider, start]) => `${provider} since ${new Date(start).toLocaleDateString()}`)
+    .join(", ");
+  ids.activityTiles.forEach((tile) => {
+    tile.title = `${tile.dataset.help} ${since ? `Counted for ${since}.` : "No activity is recorded yet."}`;
+  });
 }
 
 const UNIT_LABEL = { hour: "Hour", day: "Day", week: "Week", month: "Month" };

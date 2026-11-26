@@ -514,12 +514,12 @@ def test_highlights_count_chats_bots_and_activity(tmp_path) -> None:
     assert database.highlights() == {
         "chats": 3, "bots_used": 3, "bots_total": 3,
         "replies": 1, "tool_calls": 4, "tools_used": 3, "scheduled_runs": 1,
-        "activity_since": old.isoformat(),
+        "activity_since": {"claude": now.isoformat(), "hermes": now.isoformat(), "cline": old.isoformat()},
     }
     week = database.highlights(window="7d")
     assert (week["chats"], week["bots_used"], week["bots_total"]) == (2, 2, 3)
     assert (week["tool_calls"], week["tools_used"]) == (3, 2)
-    assert week["activity_since"] == old.isoformat()  # the oldest row, whatever the window
+    assert week["activity_since"]["cline"] == old.isoformat()  # the oldest row, whatever the window
     hermes = database.highlights(provider="hermes")
     assert (hermes["replies"], hermes["tool_calls"], hermes["tools_used"], hermes["scheduled_runs"]) == (0, 1, 1, 1)
 
@@ -538,7 +538,8 @@ def test_highlights_follow_the_machine(tmp_path) -> None:
     assert database.highlights(host="laptop")["tools_used"] == 1
     assert database.highlights()["bots_total"] == 2
     empty = database.highlights(host="nobody")
-    assert empty["tool_calls"] == 0 and empty["activity_since"] is None
+    assert empty["tool_calls"] == 0 and empty["activity_since"] == {}
+    assert set(database.highlights(host="laptop")["activity_since"]) == {"claude"}
 
 
 def test_init_adds_the_activity_table_to_old_databases(tmp_path) -> None:

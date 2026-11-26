@@ -133,6 +133,10 @@ button {
 /* Values are formatted compactly in app.js (count/money); the wrap rules below are a last resort. */
 .cards strong { display: block; font-size: clamp(20px, 3vw, 30px); line-height: 1.1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .cards small { display: block; color: var(--muted); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+/* "4 of 5": the total stays on the line of the value. */
+.cards strong small { display: inline; margin: 0; font-size: 14px; font-weight: 400; }
+/* The activity row: six tiles in one row, three columns when narrower, two on a phone. */
+.highlights { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .row strong { white-space: nowrap; text-align: right; }
 .row strong small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
 
@@ -281,6 +285,7 @@ button {
 @media (max-width: 1020px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid > .panel:last-child { grid-column: 1 / -1; }
+  .highlights { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 @media (max-width: 780px) {
@@ -289,5 +294,6 @@ button {
   .controls > * { flex: 1 1 100%; }
   .segmented button { flex: 1 1 auto; min-width: 0; padding: 0 6px; }
   .cards, .grid { grid-template-columns: 1fr; }
+  .highlights { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wide, .grid > .panel:last-child { grid-column: auto; }
 }
