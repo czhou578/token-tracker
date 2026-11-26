@@ -322,3 +322,41 @@ def test_first_start_with_activity_collection_reads_every_transcript_once(isolat
     later = Collector()
     assert later.restore_state() == 1
     assert later.scan_once() == 0 and reads == []
+
+
+def test_collector_stores_hermes_activity_and_keeps_its_position(isolated, monkeypatch):
+    db_path = isolated / "state.db"
+    connection = _hermes_db(db_path)
+    connection.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("cron_1", "cron", "deepseek-v4-flash-0731", None, 1793000000.0, None, "/p", "/p", 100, 20, 0, 0, 0),
+    )
+    connection.execute(
+        """CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT,
+            tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL, finish_reason TEXT)"""
+    )
+    insert = "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp, finish_reason) VALUES ('cron_1', ?, ?, ?, ?, ?, ?)"
+    connection.execute(insert, ("tool", None, "call_1", "terminal", 1793000001.0, None))
+    connection.execute(insert, ("assistant", "Done.", None, None, 1793000002.0, "stop"))
+    connection.commit()
+    collector = Collector()
+
+    assert collector.scan_once() == 1
+    assert _counts(collector) == (1, 1, 1, 1)
+    assert collector.database.highlights(provider="hermes")["scheduled_runs"] == 1
+
+    connection.execute(insert, ("tool", None, "call_2", "web_search", 1793000003.0, None))
+    connection.commit()
+    connection.close()
+    _bump_mtime(db_path)
+    collector.scan_once()
+    assert _counts(collector) == (1, 2, 2, 1)
+    collector.database.close()
+
+    starts: list[int] = []
+    real = service.parse_hermes_activity
+    monkeypatch.setattr(service, "parse_hermes_activity", lambda path, after=0: starts.append(after) or real(path, after))
+    restarted = Collector()
+    restarted.scan_once()
+    assert starts == [3]  # the position survives a restart
+    assert _counts(restarted) == (1, 2, 2, 1)

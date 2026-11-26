@@ -15,6 +15,7 @@ from tokentracker.collector.parser import (
     GatewayLog,
     parse_cline_sqlite,
     parse_cline_task_history,
+    parse_hermes_activity,
     parse_hermes_state_db,
     session_project,
 )
@@ -34,6 +35,8 @@ GATEWAY_META_KEY = "collector_gateway_log_v1"
 # Set after the collector first ran with activity collection. Until then the saved transcript signatures are not
 # used, so the first scan reads every transcript from the top and stores the activity of the lines read before.
 ACTIVITY_BACKFILL_META_KEY = "activity_backfill_v1"
+# The id of the newest Hermes `messages` row whose activity is stored, with the path of that database.
+HERMES_ACTIVITY_META_KEY = "collector_hermes_activity_v1"
 # The gateway log holds every response of a local model. The transcripts hold the main turns, written within seconds
 # of the response. A gateway line waits this long before it is compared with the stored transcript rows, so a main
 # turn counts once, from its transcript, and only the side requests count from the log.
@@ -77,6 +80,7 @@ class Collector:
         self.database = UsageDatabase(self.settings.db_path, hostname=self.settings.hostname, persistent=True)
         self.gateway = GatewayLog(self.settings.gateway_log) if self.settings.gateway_log else None
         self._gateway_pending: list[tuple[int, UsageEvent]] = []  # (line offset, event) younger than the grace period
+        self._hermes_after: int | None = None  # loaded from the database on the first Hermes read
         self.forwarder = Forwarder(self.settings, self.database)
         self.pricing_file = self.settings.pricing_file
         self.pricing = Pricing.load(self.pricing_file)
@@ -101,6 +105,7 @@ class Collector:
             # Hermes rows are per-session aggregates that grow while the session
             # is open, so refresh existing rows instead of ignoring them.
             inserted += self.database.upsert_events(prepare(parse_hermes_state_db(self.hermes_db)))
+            self._scan_hermes_activity()
         if inserted:
             self.forwarder.notify()
         self.forwarder.flush()
@@ -173,6 +178,17 @@ class Collector:
         for stale in [path for path in self._transcripts if path not in present]:
             del self._transcripts[stale]
         return inserted
+
+    def _scan_hermes_activity(self) -> None:
+        """Store the Hermes activity of the message rows written since the last read."""
+        if self._hermes_after is None:
+            position = self.database.get_meta(HERMES_ACTIVITY_META_KEY) or {}
+            self._hermes_after = int(position.get("after") or 0) if position.get("path") == str(self.hermes_db) else 0
+        events, newest = parse_hermes_activity(self.hermes_db, self._hermes_after)
+        self.database.insert_activity(events)
+        if newest != self._hermes_after:
+            self._hermes_after = newest
+            self.database.set_meta(HERMES_ACTIVITY_META_KEY, {"path": str(self.hermes_db), "after": newest})
 
     def _scan_gateway(self) -> int:
         """Store the gateway lines older than the grace period whose message id no stored row has."""
