@@ -81,6 +81,7 @@ class Collector:
         self.gateway = GatewayLog(self.settings.gateway_log) if self.settings.gateway_log else None
         self._gateway_pending: list[tuple[int, UsageEvent]] = []  # (line offset, event) younger than the grace period
         self._hermes_after: int | None = None  # loaded from the database on the first Hermes read
+        self._new_activity = 0  # activity rows stored since the forwarder was last told
         self.forwarder = Forwarder(self.settings, self.database)
         self.pricing_file = self.settings.pricing_file
         self.pricing = Pricing.load(self.pricing_file)
@@ -106,7 +107,8 @@ class Collector:
             # is open, so refresh existing rows instead of ignoring them.
             inserted += self.database.upsert_events(prepare(parse_hermes_state_db(self.hermes_db)))
             self._scan_hermes_activity()
-        if inserted:
+        if inserted or self._new_activity:
+            self._new_activity = 0
             self.forwarder.notify()
         self.forwarder.flush()
         if self._parsed:
@@ -170,7 +172,7 @@ class Collector:
                 if events:
                     inserted += self.database.insert_events(self._prepare(events))
                 if transcript.activity:
-                    self.database.insert_activity(transcript.activity)
+                    self._new_activity += self.database.insert_activity(transcript.activity)
                     transcript.activity = []
             except Exception:
                 transcript.reset()  # read it from the top next time, so nothing is skipped
@@ -185,7 +187,7 @@ class Collector:
             position = self.database.get_meta(HERMES_ACTIVITY_META_KEY) or {}
             self._hermes_after = int(position.get("after") or 0) if position.get("path") == str(self.hermes_db) else 0
         events, newest = parse_hermes_activity(self.hermes_db, self._hermes_after)
-        self.database.insert_activity(events)
+        self._new_activity += self.database.insert_activity(events)
         if newest != self._hermes_after:
             self._hermes_after = newest
             self.database.set_meta(HERMES_ACTIVITY_META_KEY, {"path": str(self.hermes_db), "after": newest})
