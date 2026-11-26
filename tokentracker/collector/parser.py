@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from tokentracker.collector.config import CLAUDE_PROVIDER, CLINE_PROVIDER, HERMES_PROVIDER
-from tokentracker.collector.models import UsageEvent
+from tokentracker.collector.models import ActivityEvent, UsageEvent
 
 
 TOKEN_KEYS = {
@@ -42,10 +42,14 @@ class ClaudeTranscript:
     line number. When the file shrinks, is replaced, or no longer ends a line
     where the last read stopped, the next read starts over from the top (the
     database ignores rows it already has).
+
+    Each read also collects the activity of the new lines in `activity`: the
+    tool calls, the replies and the scheduled runs (`_claude_activity`).
     """
 
     def __init__(self, path: Path, root: Path):
         self.path = path
+        self.activity: list[ActivityEvent] = []  # found by the last read
         # Computed once: resolve() costs a syscall per path component.
         self._source = str(path.resolve())
         self._project = _project_from_path(path, root)
@@ -67,6 +71,7 @@ class ClaudeTranscript:
         if self.signature is not None and (stat.st_ino != self.signature[0] or stat.st_size < self._offset):
             self.reset()
         events: list[UsageEvent] = []
+        self.activity = []
         with self.path.open("rb") as handle:
             if self._offset:
                 handle.seek(self._offset - 1)
@@ -96,6 +101,8 @@ class ClaudeTranscript:
             return None
         if not isinstance(payload, dict):
             return None
+        # Before the response check: the tool calls are on the later lines of a response.
+        self.activity.extend(_claude_activity(payload, self._project))
         response_id = _claude_response_id(payload)
         if response_id is not None:
             if response_id in self._seen:
@@ -150,6 +157,54 @@ def _claude_event(payload: dict, source_id: str, project: str | None) -> UsageEv
         total_tokens=total_tokens,
         metadata_json=_dumps(_claude_pricing_metadata(usage, message)),
     )
+
+
+TOOL_CALL_BLOCKS = ("tool_use", "server_tool_use")
+
+
+def _claude_activity(payload: dict, project: str | None) -> list[ActivityEvent]:
+    """Return the activity of one transcript line.
+
+    - A tool call is a `tool_use` block of an assistant line. Its id is unique
+      everywhere, so a session that Claude Code copies to a second file counts once.
+    - A reply is an assistant message with `stop_reason` "end_turn" in the main
+      chain. A subagent answers the model, not the user, so its final message
+      does not count. Every line of the message repeats the message id.
+    - A scheduled run is a `scheduled_task_fire` system line.
+    """
+    line_type = payload.get("type")
+    if line_type == "system":
+        line_id = payload.get("uuid")
+        if payload.get("subtype") != "scheduled_task_fire" or not isinstance(line_id, str) or not line_id:
+            return []
+        found = [("scheduled_run", f"run:{line_id}", None)]
+        model = None
+    elif line_type == "assistant" and isinstance(payload.get("message"), dict):
+        message = payload["message"]
+        model = _first_string(message, "model")
+        content = message.get("content")
+        found = [
+            ("tool_call", f"tool:{block['id']}", _first_string(block, "name") or "unknown")
+            for block in (content if isinstance(content, list) else ())
+            if isinstance(block, dict) and block.get("type") in TOOL_CALL_BLOCKS
+            and isinstance(block.get("id"), str) and block["id"]
+        ]
+        message_id = _first_string(message, "id")
+        if message_id and message.get("stop_reason") == "end_turn" and not payload.get("isSidechain"):
+            found.append(("reply", f"reply:{message_id}", None))
+    else:
+        return []
+    if not found:
+        return []
+    timestamp = _parse_timestamp(payload.get("timestamp"))
+    thread_id = _first_string(payload, "sessionId", "session_id")
+    return [
+        ActivityEvent(
+            source_id=source_id, kind=kind, name=name, timestamp=timestamp, thread_id=thread_id,
+            project=project, provider=CLAUDE_PROVIDER, model=model,
+        )
+        for kind, source_id, name in found
+    ]
 
 
 def _claude_pricing_metadata(usage: dict, message: object = None) -> dict:

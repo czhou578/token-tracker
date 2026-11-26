@@ -79,6 +79,7 @@ def test_restart_skips_transcripts_unchanged_since_a_clean_shutdown(isolated, mo
     transcript.parent.mkdir()
     transcript.write_text(_claude_line("m1", 10))
     first = Collector()
+    first.restore_state()  # as `run_forever` does; it also records that activity collection has run
     first.scan_once()
     first.save_state()
     first.database.close()
@@ -254,3 +255,70 @@ def test_a_gateway_line_waits_for_the_grace_period_and_its_position_survives_a_r
     monkeypatch.setattr(service, "GATEWAY_GRACE_SECONDS", 0)
     assert second.scan_once() == 1
     assert second.database.stats()["total_tokens"] == 6 + 8
+
+
+def _activity_lines() -> str:
+    def assistant(message_id: str, content: list, stop_reason: str) -> str:
+        message = {"id": message_id, "model": "claude-opus-5-5", "stop_reason": stop_reason,
+                   "usage": {"input_tokens": 10, "output_tokens": 1}, "content": content}
+        return json.dumps({"type": "assistant", "timestamp": "2026-10-31T10:00:00Z", "sessionId": "s1", "message": message}) + "\n"
+
+    def tool(call_id: str, name: str) -> dict:
+        return {"type": "tool_use", "id": call_id, "name": name}
+
+    fire = {"type": "system", "subtype": "scheduled_task_fire", "uuid": "fire-1", "timestamp": "2026-10-31T10:00:00Z", "sessionId": "s1"}
+    return (
+        json.dumps(fire) + "\n"
+        + assistant("msg_1", [tool("toolu_1", "Bash"), tool("toolu_2", "Bash")], "tool_use")
+        + assistant("msg_2", [tool("toolu_3", "Edit")], "tool_use")
+        + assistant("msg_3", [{"type": "text"}], "end_turn")
+    )
+
+
+def _counts(collector: Collector) -> tuple[int, int, int, int]:
+    counts = collector.database.highlights()
+    return counts["replies"], counts["tool_calls"], counts["tools_used"], counts["scheduled_runs"]
+
+
+def test_collector_stores_the_activity_of_a_transcript(isolated):
+    transcript = isolated / "claude" / "proj" / "a.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_text(_activity_lines())
+    collector = Collector()
+
+    assert collector.scan_once() == 3
+    assert _counts(collector) == (1, 3, 2, 1)
+    assert collector.database.highlights(host=collector.settings.hostname)["tool_calls"] == 3
+
+    # Claude Code copies a session to a second file (a worktree): the ids repeat, the counts do not.
+    copy = isolated / "claude" / "proj-worktree" / "a.jsonl"
+    copy.parent.mkdir()
+    copy.write_text(_activity_lines())
+    collector.scan_once()
+    assert _counts(collector) == (1, 3, 2, 1)
+
+
+def test_first_start_with_activity_collection_reads_every_transcript_once(isolated, monkeypatch):
+    transcript = isolated / "claude" / "proj" / "a.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_text(_activity_lines())
+    old = Collector()  # stands for the version before activity collection
+    old.scan_once()
+    old.save_state()
+    with old.database.connect() as connection:
+        connection.execute("DELETE FROM activity_events")
+    old.database.close()
+
+    upgraded = Collector()
+    assert upgraded.restore_state() == 0  # the saved signatures are not used this once
+    assert upgraded.scan_once() == 0  # the usage rows are already stored
+    assert _counts(upgraded) == (1, 3, 2, 1)
+    upgraded.save_state()
+    upgraded.database.close()
+
+    reads: list[Path] = []
+    real_read = service.ClaudeTranscript.read
+    monkeypatch.setattr(service.ClaudeTranscript, "read", lambda self, stat=None: reads.append(self.path) or real_read(self, stat))
+    later = Collector()
+    assert later.restore_state() == 1
+    assert later.scan_once() == 0 and reads == []
