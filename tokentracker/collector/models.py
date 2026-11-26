@@ -40,3 +40,27 @@ class UsageEvent:
         if self.total_tokens:
             return self
         return replace(self, total_tokens=sum(getattr(self, name) for name in TOKEN_FIELDS))
+
+
+ACTIVITY_KINDS = ("reply", "tool_call", "scheduled_run")
+
+
+@dataclass(slots=True, kw_only=True)
+class ActivityEvent:
+    """One action that the dashboard counts and that is not a model request.
+
+    `kind` is one of `ACTIVITY_KINDS`: a final answer of the assistant, a tool
+    call of a model, or a run that a schedule started. `name` is the tool name
+    of a tool call. `source_id` is the id the source gives the action (the
+    tool call id, the message id), so a second read adds nothing.
+    """
+
+    source_id: str
+    kind: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    name: str | None = None
+    thread_id: str | None = None
+    project: str | None = None
+    provider: str = "claude"
+    host: str | None = None
+    model: str | None = None
